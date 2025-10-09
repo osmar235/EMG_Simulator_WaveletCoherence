@@ -21,7 +21,12 @@ from functions import (
 )
 
 import numpy as np
-from functions import *
+from functions import (
+  generate_modulated_EMG_physiological_upgraded,
+  simulate_bipolar_emg_spatial,
+  bandpass_emg, zscore, resample_to_fs,
+  compute_wavelet_coherence, mc_null_threshold
+)
 
 EMG_L, EMG_R, fs = generate_modulated_EMG_physiological_upgraded(
     motorunits_max=72, n_fibers=346, FreqInputTotal=100,
