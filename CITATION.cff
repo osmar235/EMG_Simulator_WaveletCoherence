@@ -1,0 +1,20 @@
+
+### `CITATION.cff` (template—fill in the DOIs and authors)
+```yaml
+cff-version: 1.2.0
+title: "EMG Simulator – Wavelet Coherence"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: YourLastName
+    given-names: YourFirstName
+  # add coauthors
+repository-code: "https://github.com/yourname/emg-simulator-waveletcoherence"
+identifiers:
+  - type: doi
+    value: 10.xxxx/your-paper-doi
+  - type: doi
+    value: 10.xxxx/your-zenodo-doi
+preferred-citation:
+  type: article
+  doi: 10.xxxx/your-paper-doi
