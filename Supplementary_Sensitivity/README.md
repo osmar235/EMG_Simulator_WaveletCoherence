@@ -7,7 +7,7 @@ Coordination"* (CMPB-D-25-06796).
 
 ## What is in this folder
 
-| File | Reviewer item | What it does |
+| File | What it does |
 | --- | --- | --- |
 | `sensitivity_tau_m.py` | Sweeps the LIF membrane time constant tau_m and reports band-median wavelet coherence. Tests whether alpha-band insensitivity is a property of the input structure or a parameter artifact. |
 | `sensitivity_nuisance_control.py` | Sweeps two purely *downstream* nuisance parameters (MUAP duration, EMG SNR) and one *input-structure* parameter (cortical bandwidth), to show the beta <-> low-gamma redistribution arises from input structure, not generic parameter sensitivity. |
