@@ -1,19 +1,9 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite the article (preferred citation) and the archived software release."
-title: "EMG_Simulator_WaveletCoherence: bilateral EMG simulation and EMG-EMG wavelet coherence"
+title: "EMG Simulator - Wavelet Coherence"
+message: "Please cite the associated article and the archived software release used in your analysis."
 type: software
-version: "2.0.0"
-date-released: 2026-09-27
-license: MIT
-doi: "10.5281/zenodo.19703513"
-repository-code: "https://github.com/osmar235/EMG_Simulator_WaveletCoherence"
-keywords:
-  - electromyography
-  - EMG simulation
-  - intermuscular coherence
-  - wavelet coherence
-  - motor unit
-  - bimanual coordination
+version: "3.3.0"
+date-released: 2026-09-26
 authors:
   - family-names: "Pinto Neto"
     given-names: "Osmar"
@@ -25,22 +15,7 @@ authors:
     given-names: "Gustavo"
   - family-names: "Kennedy"
     given-names: "Deanna M."
-preferred-citation:
-  type: article
-  title: "A Computational Framework for EMG Simulation and Coherence-Based Biomarker Analysis on Neural Crosstalk in Bimanual Coordination"
-  authors:
-    - family-names: "Pinto Neto"
-      given-names: "Osmar"
-    - family-names: "Pinho"
-      given-names: "Tatiana O. R."
-    - family-names: "Wang"
-      given-names: "Yiyu"
-    - family-names: "Balbinot"
-      given-names: "Gustavo"
-    - family-names: "Kennedy"
-      given-names: "Deanna M."
-  journal: "Computer Methods and Programs in Biomedicine"
-  year: 2026
-  number: "109657"
-  doi: "10.1016/j.cmpb.2026.109657"
-  url: "https://doi.org/10.1016/j.cmpb.2026.109657"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.19703513"
+    description: "Software archive DOI reported in the associated manuscript; update if V3 receives a new version DOI."

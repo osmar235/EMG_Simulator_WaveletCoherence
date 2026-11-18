@@ -1,0 +1,67 @@
+{
+  "code_version": "3.3.0",
+  "analysis_status": "V3.3 corrected primary",
+  "trials_per_cell": 1,
+  "base_seed": 20260926,
+  "cortical_high_hz": [
+    30,
+    60
+  ],
+  "crosstalk_R2L": [
+    0.0,
+    0.05,
+    0.1,
+    0.15,
+    0.2,
+    0.25,
+    0.3,
+    0.35
+  ],
+  "crosstalk_L2R": 0.01,
+  "mixtures_coefficients_used_to_infer_fraction": {
+    "100_0": [
+      6.0,
+      0.0
+    ],
+    "75_25": [
+      4.875,
+      1.625
+    ],
+    "50_50": [
+      3.25,
+      3.25
+    ]
+  },
+  "common_drive_normalization": "rms",
+  "common_drive_target_rms": 6.0,
+  "common_fraction_interpretation": "amplitude",
+  "note_75_25": "75/25 denotes amplitude weighting; for independent equal-variance sources this is approximately 90/10 variance contribution.",
+  "snr_units": "db",
+  "SNR_drive_db": 40,
+  "SNR_MU_db": 8,
+  "SNR_EMG_db": 40,
+  "usable_duration_s": 18.0,
+  "burn_in_s": 1.0,
+  "intent_variability_rms_fraction": 0.01,
+  "intent_mode": "bounded",
+  "coherence_preprocessing": {
+    "bandpass_hz": [
+      5,
+      499
+    ],
+    "detrend": true,
+    "taper": "none",
+    "matviyenko_K": null,
+    "primary_v3_3_taper": "none",
+    "band_medians_exclude_COI": true
+  },
+  "wavelet": {
+    "mother": "Morlet",
+    "w0": 6,
+    "dj": 0.125,
+    "fmax_hz": 128
+  },
+  "primary_null_inference": "same-condition cross-trial derangement; run trial_shuffle_null_v3.py",
+  "phase_randomization_status": "legacy diagnostic only; not primary inference",
+  "saved_null_signals": true
+}

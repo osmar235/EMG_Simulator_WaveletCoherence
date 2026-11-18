@@ -1,0 +1,63 @@
+EMG Simulator validation - functions.py v3.3.0
+==============================================================================
+
+1. Fixed-RMS common drive
+[PASS] mixture 100%/0% -- RMS=6.000000000000, amplitude fraction=1.000
+[PASS] mixture 75%/25% -- RMS=6.000000000000, amplitude fraction=0.750
+[PASS] mixture 50%/50% -- RMS=6.000000000000, amplitude fraction=0.500
+[PASS] 75/25 amplitude implies 90/10 variance under independence -- cortical variance fraction=0.900
+   Legacy coefficient RMS values (diagnostic only):
+      100%/0%: 6.0000
+      75%/25%: 5.1390
+      50%/50%: 4.5966
+
+2. Explicit dB SNR
+[PASS] requested 8 dB -- measured=8.00000000 dB
+[PASS] requested 20 dB -- measured=20.00000000 dB
+[PASS] requested 40 dB -- measured=40.00000000 dB
+
+3. LIF continuity / 100-ms reset regression
+[PASS] single continuous call matches v1 local LIF rule -- 5 thresholds
+[PASS] 100-ms chunks with carried state equal continuous integration
+[PASS] reset-every-100ms artifact path is not the V3 result
+
+4. Exact usable duration and reproducibility
+[PASS] returned duration -- n=10000, expected=10000, seconds=2.000000
+[PASS] bitwise reproducibility
+[PASS] common RMS reported by generator -- RMS=6.000000000000
+[PASS] generator dB SNR -- left=40.00000000 dB
+[PASS] no conspicuous 100-ms population burst -- 100-ms first-bin/mean=0.100; nearby=[1.393 0.207 0.622 1.297]
+
+5. Bounded intent variability
+[PASS] 1% RMS interpretation -- RMS=0.01000000, range=[-0.0271,0.0185]
+[PASS] no secular ramp -- end-to-end fitted drift < 1 percentage point
+
+6. Legacy Fourier phase-randomized diagnostic
+[PASS] plain phase randomization preserves periodogram -- max relative error=3.49e-14
+
+7. Same-condition cross-trial null helper
+[PASS] derangement has no fixed trial labels
+[PASS] derangement is a true permutation
+
+8. Complex wavelet smoothing
+[PASS] time + scale smoothing -- brute-force max error=2.12e-10
+[PASS] imaginary cross-spectrum retained
+
+9. Matviyenko taper port (sensitivity only)
+[PASS] MATLAB-equation reference values -- max abs error=2.22e-16
+[PASS] symmetric 2*n output
+[PASS] valid coefficient orders K=2..13
+[PASS] odd lengths rejected rather than silently altered
+
+10. Coherence preprocessing
+[PASS] primary untapered preprocessing is z-scored
+[PASS] deterministic Matviyenko sensitivity preprocessing
+[PASS] analysis taper leaves source EMG unchanged
+[PASS] untapered primary differs from tapered sensitivity input
+
+11. Optional pycwt runtime
+[INFO] pycwt available: 0.4.0b1.dev10+g3343016af.d20251028
+[PASS] cached CWT pairing equals direct coherence
+
+==============================================================================
+RESULT: 31/31 checks passed

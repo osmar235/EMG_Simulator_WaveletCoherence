@@ -1,0 +1,100 @@
+{
+  "description": "Version 3.3 corrected rerun of the manuscript factorial design",
+  "bilateral_trials": 720,
+  "emg_signals": 1440,
+  "trials_per_cell": 15,
+  "crosstalk_R2L": [
+    0.0,
+    0.05,
+    0.1,
+    0.15,
+    0.2,
+    0.25,
+    0.3,
+    0.35
+  ],
+  "crosstalk_L2R": 0.01,
+  "common_drive_mixtures": {
+    "100_0": {
+      "legacy_weights": [
+        6.0,
+        0.0
+      ],
+      "cortical_fraction": 1.0
+    },
+    "75_25": {
+      "legacy_weights": [
+        4.875,
+        1.625
+      ],
+      "cortical_fraction": 0.75,
+      "variance_fraction_if_independent_equal_variance": 0.9
+    },
+    "50_50": {
+      "legacy_weights": [
+        3.25,
+        3.25
+      ],
+      "cortical_fraction": 0.5
+    }
+  },
+  "common_drive_normalization": "rms",
+  "common_drive_target_rms": 6.0,
+  "common_fraction_interpretation": "amplitude",
+  "cortical_high_hz": [
+    30,
+    60
+  ],
+  "snr_units": "db",
+  "snr_db": {
+    "drive": 40,
+    "motor_unit": 8,
+    "emg": 40
+  },
+  "usable_duration_s": 18.0,
+  "burn_in_s": 1.0,
+  "intent_variability": {
+    "mode": "bounded",
+    "rms_fraction": 0.01,
+    "cutoff_hz": 0.25
+  },
+  "coherence_preprocessing": {
+    "bandpass_hz": [
+      5,
+      499
+    ],
+    "detrend": true,
+    "taper": "none",
+    "primary_v3_3": "No full-record taper; exclude outside COI.",
+    "matviyenko_status": "Sensitivity analysis only; exact MATLAB port retained; historical K unknown."
+  },
+  "wavelet": {
+    "mother": "Morlet",
+    "w0": 6,
+    "dj": 0.125,
+    "fmax_hz": 128
+  },
+  "summary_bands_hz": [
+    [
+      5,
+      13
+    ],
+    [
+      13,
+      30
+    ],
+    [
+      30,
+      60
+    ],
+    [
+      60,
+      100
+    ]
+  ],
+  "exclude_outside_coi": true,
+  "code_version": "3.3.0",
+  "primary_null_inference": "same-condition cross-trial derangement",
+  "primary_statistical_model": "mixed ART with random intercept (1|trial_id)",
+  "save_null_signals": true
+}

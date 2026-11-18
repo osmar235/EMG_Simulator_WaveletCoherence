@@ -1,187 +1,141 @@
-# EMG_Simulator_WaveletCoherence
+# EMG Simulator - Wavelet Coherence, Version 3.3.0
 
-Bilateral EMG simulation and EMG-EMG wavelet coherence.
+Version 3.3 is the corrected analysis baseline built from the V2 implementation and the V3 scientific/reproducibility fixes. V1 and V2 remain under `legacy/` for audit and comparison.
 
-This repository is a Python toolbox for two tasks:
+## V3.3 primary decisions
 
-1. **Simulating realistic bilateral surface EMG.** The model covers cortical and subcortical common drive, cross-limb neural crosstalk, leaky integrate-and-fire motor-unit pools with adaptation, MUAP synthesis and a bipolar electrode model.
-2. **Measuring EMG-EMG (intermuscular) coherence with the Morlet wavelet transform.** This works on simulated signals or on your own recordings, and includes a matched cross-trial significance test.
+1. **Fixed common-drive magnitude.** The cortical/subcortical mixture is composed first, then the combined common drive is RMS-normalized to 6.0 in every 100/0, 75/25, and 50/50 condition. This removes the old 6.0 -> 5.14 -> 4.60 common-drive-strength confound.
+2. **Mixture labels are amplitude weights.** The historical 4.875:1.625 coefficients are a 3:1 amplitude ratio. For independent equal-variance sources, 75/25 amplitude corresponds to approximately 90/10 variance contribution. Do not describe 75/25 as 75/25 power.
+3. **SNR is explicit in dB.** A requested value of 40 means 40 dB.
+4. **Exact usable duration.** `T_end=18` returns 18 s after a separate burn-in.
+5. **Continuous LIF state.** Membrane, refractory, and adaptation state do not reset every 100 ms.
+6. **Bounded intent variability.** `Intent_variability=0.01` is approximately 1% RMS low-frequency variation, not 1% growth per second.
+7. **Primary coherence preprocessing uses NO full-record taper.** The 5-499 Hz non-rectified bipolar EMG is detrended and z-scored; wavelet band summaries exclude the cone of influence (COI).
+8. **Matviyenko remains available only as a sensitivity analysis.** The exact user-supplied MATLAB implementation is preserved in `reference_matlab/matviyenko.m` and ported exactly. Historical K is unknown.
+9. **Primary null inference uses same-condition cross-trial pairing/derangements.** Phase randomization is retained only as a legacy diagnostic because it destroys the task-locked burst structure.
+10. **Primary factorial statistics use mixed ART** with `(1 | trial_id)` because the four frequency-band values from one bilateral trial are repeated/correlated observations. The fixed-effects ART is retained as a manuscript-reproduction analysis.
+11. **Independent per-MU synaptic noise remains deferred.** It is a future model extension/sensitivity study, not part of the corrected baseline.
 
-It is the software of:
+## Files
 
-> Pinto Neto O, Pinho TOR, Wang Y, Balbinot G, Kennedy DM. **A Computational Framework for EMG Simulation and Coherence-Based Biomarker Analysis on Neural Crosstalk in Bimanual Coordination.** *Computer Methods and Programs in Biomedicine* (2026) 109657. https://doi.org/10.1016/j.cmpb.2026.109657
+- `functions.py` - V3.3 simulator, preprocessing, wavelet coherence, Matviyenko port, cached CWT helpers, derangement helper
+- `run_single_demo.py` - one representative simulation; V3.3 primary defaults to no taper
+- `run_factorial_v3.py` - full 720-trial factorial runner; defaults to no taper and saves per-cell signals for matched null analysis
+- `trial_shuffle_null_v3.py` - same-condition cross-trial/derangement null analysis
+- `analysis_art_v3.R` - primary mixed ART plus secondary fixed-effects manuscript-reproduction ART
+- `validate_v3.py` - V3.3 validation suite, including restored V2 LIF continuity/window-reset checks
+- `MODEL_DECISIONS_V3.md` - scientific decisions and rationale
+- `EMG_SIMULATION_VERSION_HISTORY_MEMORY_LOG.md` - cumulative V1 -> V3.3 decision log
+- `WINDOWS_TEST_COMMANDS.md` - Windows CMD commands for the user's venv
+- `V3_2_FULL_RUN_RESULT_NOTE.md` - descriptive note on the uploaded completed V3.2 factorial CSV
+- `reference_matlab/matviyenko.m` - supplied MATLAB source
 
-## How to cite
+## Validate first
 
-If you use this code, please cite the article above **and** the archived software. This applies whether you use the simulator, the coherence analysis, or both.
-
-> Pinto Neto O, Pinho TOR, Wang Y, Balbinot G, Kennedy DM. EMG_Simulator_WaveletCoherence (software). Zenodo. https://doi.org/10.5281/zenodo.19703513
-
-GitHub's **"Cite this repository"** button, in the right-hand panel, gives both references in APA and BibTeX from `CITATION.cff`.
-
-## Installation
-
-You need Python 3.9 or newer.
-
-```bash
-git clone https://github.com/osmar235/EMG_Simulator_WaveletCoherence.git
-cd EMG_Simulator_WaveletCoherence
-python -m venv .venv
-# Windows:  .venv\Scripts\activate        macOS/Linux:  source .venv/bin/activate
-pip install -r requirements.txt
-python tests/validate.py        # quick self-test, ~5 s -> "RESULT: 13/13 checks passed"
+```bat
+C:\Users\osmar\projects\.venv\Scripts\python.exe validate_v3.py
 ```
 
-Everything lives in one file, `functions.py`. Scripts either run from the repository folder, or add that folder to `sys.path`.
+Expected V3.3 result:
 
----
-
-## 1. Simulate bilateral EMG
-
-### Quick start
-
-```bash
-python run_single_demo.py                     # one-click demo (same as examples/simulate_demo.py)
-python examples/simulate_demo.py --crosstalk 0.35 --mixture 50_50 --cortical-high 30 --seed 7
+```text
+RESULT: 30/30 checks passed
 ```
 
-Outputs go to `results/demo/`:
+If `pycwt` is installed, the validation script also checks that cached-CWT pair coherence exactly matches direct coherence.
 
-- `demo_emg_1k.csv`: the two EMG signals.
-- Figures of the EMG signals and of the coherence map.
-- Band-median coherence.
+## Representative V3.3 demo
 
-### In Python
+Primary analysis: no taper, no phase-surrogate inference.
 
-```python
-import functions as F
-
-# Representative configuration of the article:
-# 1:2 bimanual task (0.5 / 1.0 Hz force envelopes), 72 motor units per limb,
-# common drive 75/25 cortical (13-60 Hz) / subcortical (5-13 Hz),
-# 20 % right-to-left crosstalk, 18 s
-left, right, fs = F.simulate_bilateral_emg(seed=1, fs_out=1000.0)
-
-# Change anything you like
-left, right, fs, info = F.simulate_bilateral_emg(
-    seed=2, T_end=30, cross_talk_R2L=0.0,            # no crosstalk
-    common_mod_cortical=6.0, common_mod_subcortical=0.0, cortical_high_hz=30,
-    freq_left=0, phase_left=1.5708, freq_right=0, phase_right=1.5708,  # constant force
-    return_spikes=True)                              # info['spikes_L'], info['spikes_R']
+```bat
+C:\Users\osmar\projects\.venv\Scripts\python.exe run_single_demo.py --taper none --surrogates 0 --outdir results\demo_v3_3_primary
 ```
 
-`simulate_bilateral_emg` returns **bipolar** surface EMG by default. Pass `bipolar=False` for monopolar signals. For full control, use `generate_modulated_EMG_physiological_upgraded(...)`; every argument has a documented default.
+The time-domain export/plot is always untapered. `single_demo_wavelet_input_1k.csv` records the actual CWT input.
 
-### Main parameters
+Matviyenko is sensitivity only:
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `T_end` | 18 | Returned duration (s). A separate 1-s burn-in is simulated first. |
-| `dt` | 0.0002 | Simulation step (s), i.e. 5 kHz. |
-| `motorunits_max` | 72 | Motor units per limb. |
-| `const_current` | 10 | Amplitude of each limb's unique drive. |
-| `common_mod_cortical`, `common_mod_subcortical` | 4.875, 1.625 | Relative amplitude weights of the common drive: 6/0 = 100/0, 4.875/1.625 = 75/25, 3.25/3.25 = 50/50. |
-| `common_drive_target_rms` | 6 | Total amplitude (SD) of the common drive, the same for every mixture. |
-| `cortical_high_hz` | 60 | Upper edge of the cortical band (13–30 or 13–60 Hz). |
-| `cross_talk_R2L`, `cross_talk_L2R` | 0.20, 0.01 | Fraction of the other limb's input mixed in (0–1). |
-| `freq_left`, `freq_right` | 0.5, 1.0 | Force-envelope frequencies (Hz). Use `freq=0, phase=pi/2` for a constant force. |
-| `Intent_variability` | 0.01 | Slow (<0.25 Hz) envelope variability, as a fractional RMS. |
-| `SNR`, `SNRF`, `SNRE` | 40, 8, 40 | SNR in dB of the drive noise, motor-unit-level noise and EMG-level noise. |
-| `muap_dur_s`, `muap_jitter_s` | 0.018, 0.004 | Mean MUAP duration and per-unit jitter (s). |
-| `min_isi_ms`, `dVth`, `tau_adapt_ms` | 18, 0.003, 250 | Refractory period and threshold adaptation. |
-| `seed` | 1234 | The same seed gives identical signals. |
-
-The docstrings of `generate_modulated_EMG_physiological_upgraded` and `simulate_bilateral_emg` list all the parameters.
-
----
-
-## 2. Wavelet coherence of your own EMG
-
-### Command line
-
-Each file holds one trial: a CSV or TXT file with one column per channel, and optionally a time column.
-
-```bash
-# one trial, 2 kHz, channels by name, remove 60-Hz mains
-python examples/analyze_emg_coherence.py my_trial.csv --fs 2000 --left FDI_L --right FDI_R --notch 60
-
-# several trials of the same condition -> also tests coherence against a matched null
-python examples/analyze_emg_coherence.py "data/condition1_*.csv" --fs 2000 --notch 50
+```bat
+C:\Users\osmar\projects\.venv\Scripts\python.exe run_single_demo.py --taper matviyenko --matviyenko-k 2 --surrogates 0 --outdir results\demo_sensitivity_K2
 ```
 
-The processing steps are:
+## Full corrected factorial
 
-1. Raw, **non-rectified** EMG.
-2. Optional mains notch.
-3. Resampling to 1 kHz.
-4. 5–499 Hz band-pass, linear detrend and z-score.
-5. Squared Morlet wavelet coherence (w0 = 6, 1/8-octave resolution, 4–128 Hz).
-6. Median coherence **inside the cone of influence** in 5–13, 13–30, 30–60 and 60–100 Hz. Other bands can be set with `--bands "8-12,15-35"`.
+Dry run:
 
-Outputs go to `results/coherence/`:
-
-- `band_medians_per_trial.csv`
-- `coherence_map_<trial>.png`
-- `cross_trial_null.csv`, when two or more trials are given.
-
-**Significance.** With two or more trials of one condition, the left signal of trial *i* is paired with the right signal of trial *j* ≠ *i*. This keeps each signal's spectrum, amplitude modulation and task timing, but removes within-trial coupling. The p-value is one-sided and is computed from derangements of the trial labels. With few trials it is exact; use at least 6 trials for a useful p-value resolution. Because the null is matched this way, it also absorbs edge and task-related coherence floors, which can be high below ~13 Hz, where surface EMG has little power.
-
-### In Python
-
-```python
-import functions as F
-
-# emg_left, emg_right: raw 1-D arrays recorded at fs_raw Hz
-x = F.preprocess_emg_for_coherence(F.resample_to_fs(emg_left, fs_raw, 1000), 1000, notch_hz=60)  # or 50 / None
-y = F.preprocess_emg_for_coherence(F.resample_to_fs(emg_right, fs_raw, 1000), 1000, notch_hz=60)
-freqs, period, coi, Rsq, *_ = F.compute_wavelet_coherence(x, y, fs=1000)
-print(F.band_medians(Rsq, freqs, period=period, coi=coi))      # {'5-13': ..., '13-30': ..., ...}
-F.plot_coherence_map(Rsq, freqs, period, coi, 1000, "coherence.png")
-
-# several trials (lists of preprocessed, equal-length arrays)
-res = F.cross_trial_null(left_trials, right_trials, fs=1000, n_perm=999)
-print(res["bands"], res["observed"], res["null_median"], res["p"])
+```bat
+C:\Users\osmar\projects\.venv\Scripts\python.exe run_factorial_v3.py --dry-run
 ```
 
----
+Smoke test:
 
-## 3. Reproduce the factorial simulation study of the article
-
-The design is 8 crosstalk levels (0–35 %) × 3 common-drive mixtures × 2 cortical bandwidths × 15 trials, which gives 720 bilateral trials.
-
-```bash
-python paper_analysis/run_factorial.py --dry-run
-python paper_analysis/run_factorial.py                                   # ~40-60 min on a laptop
-python paper_analysis/cross_trial_null_factorial.py results/factorial    # coherence vs matched null
-Rscript paper_analysis/art_analysis.R results/factorial/factorial_band_medians.csv   # ART ANOVA + post hocs
+```bat
+C:\Users\osmar\projects\.venv\Scripts\python.exe run_factorial_v3.py --trials 1 --taper none --outdir results\factorial_v3_3_smoke
 ```
 
-The R step needs R with `install.packages(c("ARTool","lme4","emmeans","dplyr","readr"))`. Seeds are fixed (`--base-seed 20260926`), so the study is reproduced exactly.
+Primary full run:
 
----
-
-## Repository contents
-
-```
-functions.py                          simulator + coherence toolbox (single file)
-run_single_demo.py                    one-click demo
-examples/simulate_demo.py             simulate one EMG pair, plot, coherence
-examples/analyze_emg_coherence.py     coherence of your own recordings (+ matched null)
-paper_analysis/run_factorial.py       factorial simulation study
-paper_analysis/cross_trial_null_factorial.py
-paper_analysis/art_analysis.R         aligned-rank-transform ANOVA
-tests/validate.py                     self-test
-requirements.txt  CITATION.cff  LICENSE
+```bat
+C:\Users\osmar\projects\.venv\Scripts\python.exe run_factorial_v3.py --trials 15 --base-seed 20260926 --taper none --outdir results\factorial_v3_3_primary
 ```
 
-## Model summary
+The primary CSV is:
 
-Each limb's input is its unique low-pass drive plus a common drive shared by both limbs. The common drive has a cortical component (13–30 or 13–60 Hz) and a subcortical component (5–13 Hz), mixed at a fixed total amplitude. This input is scaled by the task force envelope.
+```text
+results\factorial_v3_3_primary\factorial_v3_3_band_medians.csv
+```
 
-Cross-limb crosstalk mixes a fraction of one limb's input into the other. The resulting currents drive leaky integrate-and-fire motor neurons, which have graded thresholds, an 18-ms refractory period and after-spike threshold adaptation; they are integrated continuously over the whole trial.
+The runner also saves 48 compressed per-condition signal files under:
 
-Spike trains are convolved with difference-of-Gaussian MUAPs, dispersed across muscle fibres, and summed with motor-unit-level and EMG-level noise. Bipolar surface EMG is obtained by differencing the signal with a copy delayed by 1.2 ms and low-pass filtering it at 180 Hz. Coherence follows Torrence & Compo (1998) and Grinsted et al. (2004), with Gaussian smoothing in time and 0.6-octave smoothing in scale.
+```text
+results\factorial_v3_3_primary\null_signals\
+```
 
-## License
+These are 1-kHz, 5-499 Hz, detrended, z-scored, untapered trial signals used by the matched cross-trial null.
 
-MIT License (see `LICENSE`). The article is open access under CC BY 4.0.
+## Same-condition cross-trial null
+
+Smoke test on one condition:
+
+```bat
+C:\Users\osmar\projects\.venv\Scripts\python.exe trial_shuffle_null_v3.py results\factorial_v3_3_primary --permutations 99 --max-cells 1 --taper none
+```
+
+Full null analysis:
+
+```bat
+C:\Users\osmar\projects\.venv\Scripts\python.exe trial_shuffle_null_v3.py results\factorial_v3_3_primary --permutations 999 --seed 20260926 --taper none
+```
+
+For each factorial condition, the script pairs `L_i` with `R_j` for `i != j`, caches all trial CWTs, forms all off-diagonal band-coherence values, and then samples random derangements of trial labels. It exports the observed condition median, null median, null 95th percentile, observed-minus-null value, empirical one-sided p, and BH-FDR q.
+
+This null analysis is intended to interpret coherence above the matched task/burst floor. It does **not** replace the factorial ART model.
+
+## ART analysis
+
+```bat
+Rscript analysis_art_v3.R results\factorial_v3_3_primary\factorial_v3_3_band_medians.csv
+```
+
+Primary model:
+
+```r
+coherence_median ~ crosstalk * mixture * cortical_high * band + (1 | trial_id)
+```
+
+A fixed-effects ART is also generated only for comparison with the published analysis.
+
+## Matviyenko sensitivity
+
+The supplied MATLAB function is an optimized symmetric full-record window, not a short edge taper. It changes the entire record, especially for larger K. Therefore V3.3 does not apply it in the primary analysis. It can be tested separately:
+
+```bat
+C:\Users\osmar\projects\.venv\Scripts\python.exe run_factorial_v3.py --trials 3 --base-seed 20260926 --taper matviyenko --matviyenko-k 8 --outdir results\factorial_sensitivity_K8
+```
+
+The same base seed makes taper-sensitivity comparisons paired at the simulation level.
+
+## Deferred future model extension
+
+Independent per-motor-unit synaptic noise before LIF spike generation may reduce artificial within-pool synchronization, but it changes the model architecture. It is deliberately **not** part of V3.3 and should be tested in a future study/sensitivity analysis.

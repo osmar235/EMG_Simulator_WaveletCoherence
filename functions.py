@@ -1,51 +1,82 @@
-"""
-EMG_Simulator_WaveletCoherence: bilateral surface-EMG simulator and EMG-EMG
-wavelet-coherence toolbox.  https://github.com/osmar235/EMG_Simulator_WaveletCoherence
+# functions.py - EMG Simulator - Wavelet Coherence
+#
+# Version 3.3.0. Scientific/reproducibility revision built from v2.0.0.
+# v1 and v2 are preserved under legacy/ for exact comparison.
+#
+# Main v3 changes:
+#   1. Common cortical/subcortical drive can be RMS-normalized so source
+#      composition changes without changing total common-drive magnitude.
+#   2. SNR values are interpreted explicitly in dB by default.
+#   3. T_end is now the returned usable duration; burn-in is simulated separately.
+#   4. Intent variability defaults to bounded low-frequency stochastic variation
+#      rather than an unbounded percent-per-second ramp.
+#   5. The exact Matviyenko MATLAB window is retained for sensitivity analyses,
+#      but V3.3 primary coherence analysis uses no full-record taper and excludes
+#      the cone of influence (COI).
+#   6. Phase randomization is retained only as a legacy diagnostic. Primary null
+#      inference uses same-condition cross-trial pairing/derangements so the
+#      burst/task structure of the simulated EMG is preserved.
+#   7. Any analysis taper is applied only to a copy immediately before CWT and
+#      never alters exported/plotted time-domain bipolar EMG.
+#   8. pycwt is optional at import time; simulation-only workflows still run.
 
-Pinto Neto O, Pinho TOR, Wang Y, Balbinot G, Kennedy DM. A Computational Framework
-for EMG Simulation and Coherence-Based Biomarker Analysis on Neural Crosstalk in
-Bimanual Coordination. Computer Methods and Programs in Biomedicine (2026) 109657.
-https://doi.org/10.1016/j.cmpb.2026.109657
+__version__ = "3.3.0"
 
-If you use this code (simulation or coherence analysis), please cite the article
-above and the archived software (see CITATION.cff / README.md).
-
-Main entry points
------------------
-Simulation
-    simulate_bilateral_emg(...)                       -> left, right, fs[, info]
-    generate_modulated_EMG_physiological_upgraded(...) (full parameter set)
-    simulate_bipolar_emg_spatial(x, fs)               monopolar -> bipolar
-Coherence analysis (works on simulated or recorded EMG)
-    preprocess_emg_for_coherence(x, fs)               band-pass, detrend, z-score
-    compute_wavelet_coherence(x, y, fs)               squared Morlet wavelet coherence
-    band_medians(Rsq, freqs, period=, coi=)           band summaries inside the COI
-    cross_trial_null(left_trials, right_trials, fs)   matched cross-trial null / p-values
-"""
-
-__version__ = "2.0.0"
-
-import itertools
+import warnings
 import numpy as np
+import matplotlib.pyplot as plt  # noqa: F401  (kept for backward compatibility)
 from fractions import Fraction
+from typing import Tuple  # noqa: F401
 from tqdm.auto import tqdm
-from scipy.signal import (butter, filtfilt, iirnotch, resample_poly, convolve2d,
-                          detrend as scipy_detrend, windows as signal_windows)
+
+from scipy.signal import (  # noqa: F401
+    butter, filtfilt, resample_poly, welch, firls, convolve as sp_convolve, detrend as scipy_detrend
+)
+from scipy.signal import convolve2d
+from scipy.signal import windows as signal_windows
 
 try:
     import pycwt as wavelet
-except ImportError:  # simulation-only use does not need pycwt
+except ImportError:  # simulation-only use must not fail when pycwt is absent
     wavelet = None
 
-DEFAULT_BANDS = ((5, 13), (13, 30), (30, 60), (60, 100))
-
-# =============================================================================
-# Basic signal utilities
-# =============================================================================
+# ------------------------------ Basics ------------------------------
 
 def zscore(x):
     x = np.asarray(x, float)
     return (x - x.mean()) / (x.std() + 1e-12)
+
+
+def band_medians(Rsq, freqs, bands=((5, 13), (13, 30), (30, 60), (60, 100)),
+                 period=None, coi=None):
+    """Median squared wavelet coherence within each frequency band.
+
+    Rsq has shape (n_frequencies, n_times). When `period` and `coi` are both
+    given (as returned by compute_wavelet_coherence), time-frequency samples
+    outside the cone of influence are excluded (recommended). Without them the
+    behaviour is identical to v1 (all samples used).
+    """
+    Rsq = np.asarray(Rsq, float)
+    freqs = np.asarray(freqs, float)
+    if Rsq.ndim != 2 or Rsq.shape[0] != freqs.size:
+        raise ValueError("Rsq must have shape (len(freqs), n_times)")
+    use_coi = period is not None and coi is not None
+    if use_coi:
+        period = np.asarray(period, float)
+        coi = np.asarray(coi, float)
+        if period.size != freqs.size or coi.size != Rsq.shape[1]:
+            raise ValueError("period/coi dimensions do not match Rsq")
+    out = {}
+    for (f0, f1) in bands:
+        idx = np.where((freqs >= f0) & (freqs < f1))[0]
+        if idx.size == 0:
+            out[f"{f0}-{f1}"] = np.nan
+            continue
+        values = Rsq[idx, :]
+        values = values[period[idx, None] <= coi[None, :]] if use_coi else values.ravel()
+        values = values[np.isfinite(values)]
+        out[f"{f0}-{f1}"] = float(np.median(values)) if values.size else np.nan
+    return out
 
 
 def butter_filter_low(x, fc, fs, order=4):
@@ -64,31 +95,19 @@ def bandpass_emg(x, fs, low=5, high=499, order=4):
 
 
 def resample_to_fs(x, fs_in, fs_out, max_den=10000):
-    """Polyphase resampling (with anti-alias filtering) from fs_in to fs_out."""
     if np.isclose(fs_in, fs_out, rtol=1e-8, atol=1e-12):
         return np.asarray(x, float)
     frac = Fraction(fs_out/fs_in).limit_denominator(max_den)
     return resample_poly(np.asarray(x, float), frac.numerator, frac.denominator)
 
 
-def notch_filter(x, fs, f0=60.0, harmonics=3, q=30.0):
-    """Zero-phase IIR notch at f0 and its harmonics below Nyquist (power-line removal)."""
-    y = np.asarray(x, float)
-    for k in range(1, int(harmonics) + 1):
-        f = k*float(f0)
-        if f >= fs/2:
-            break
-        b, a = iirnotch(f, q, fs)
-        y = filtfilt(b, a, y)
-    return y
 
-# =============================================================================
-# Optional analysis taper: Matviyenko optimized window
-# =============================================================================
-# Coefficients of the optimized spectral window of G. Matviyenko, "Optimized local
-# trigonometric bases", Appl. Comput. Harmon. Anal. 3 (1996) 301-323, following the
-# MATLAB implementation by F. Meyer (2003). matviyenko(K, n) returns a symmetric
-# window of 2*n samples; larger K gives steeper transitions and lower side lobes.
+# ------------------------ Matviyenko spectral taper ------------------------
+# Exact coefficient port of the user-supplied MATLAB function
+#     b = matviyenko(K, n)
+# by Francois Meyer (2003), based on Gregory Matviyenko (1996).
+# The MATLAB routine returns a symmetric window of length 2*n.  K controls
+# steepness / sidelobe suppression and is defined for integer K=2,...,13.
 _MATVIYENKO_G = {
     2: [1.1002143947640],
     3: [1.1723768006269012949, 0.1855148479250006034],
@@ -106,7 +125,16 @@ _MATVIYENKO_G = {
 
 
 def matviyenko(K, n):
-    """Matviyenko optimized window of exactly 2*n samples (K = 2..13)."""
+    """Exact NumPy port of the supplied MATLAB ``matviyenko(K,n)``.
+
+    Parameters
+    ----------
+    K : int
+        Window steepness/order, 2 <= K <= 13.
+    n : int
+        Half-window length.  The returned window contains exactly ``2*n``
+        samples, matching the MATLAB routine.
+    """
     if isinstance(K, bool) or int(K) != K or not (2 <= int(K) <= 13):
         raise ValueError('K must be an integer from 2 through 13')
     if isinstance(n, bool) or int(n) != n or int(n) < 1:
@@ -124,18 +152,26 @@ def matviyenko(K, n):
 
 
 def matviyenko_window(length, K=8):
-    """Whole-record Matviyenko window for an even-length signal (rises over the
-    first half of the record and falls over the second half)."""
+    """Return a Matviyenko window with exactly ``length`` samples.
+
+    The original MATLAB definition is intrinsically even-length (2*n), so this
+    wrapper intentionally rejects odd lengths instead of silently altering the
+    historical formula.  Paper simulations at 18 s x 1000 Hz contain 18,000
+    samples and therefore satisfy this requirement exactly.
+
+    ``K=8`` is a Version-3 reproducible preset, *not* a claim that K=8 was the
+    historical value used in the published analysis; the supplied MATLAB file
+    defines K as a free parameter and does not record the old call site.
+    """
     if isinstance(length, bool) or int(length) != length or int(length) < 2:
         raise ValueError('length must be an integer >= 2')
     length = int(length)
     if length % 2:
-        raise ValueError('matviyenko_window requires an even signal length (2*n)')
+        raise ValueError('Exact Matviyenko port requires an even signal length (2*n)')
     return matviyenko(K, length // 2)
 
-# =============================================================================
-# Bipolar (spatial) projection
-# =============================================================================
+
+# --------------------------- Bipolar projection ---------------------------
 
 def _frac_delay(x, D, N=21, pad_mode="reflect"):
     x = np.asarray(x, float)
@@ -149,9 +185,6 @@ def _frac_delay(x, D, N=21, pad_mode="reflect"):
 
 
 def simulate_bipolar_emg_spatial(x, fs, tau_ms=1.2, lp_hz=180, wA=1.0, wB=1.0, fir_len=21):
-    """Bipolar surface EMG from a monopolar signal: x(t) - x(t - tau), where tau
-    is the inter-electrode propagation delay, followed by an optional low-pass
-    (tissue/electrode filtering). Set lp_hz=None to skip the low-pass."""
     D = tau_ms*1e-3*fs
     chA = x
     chB = _frac_delay(x, D, N=fir_len, pad_mode="reflect")
@@ -161,9 +194,7 @@ def simulate_bipolar_emg_spatial(x, fs, tau_ms=1.2, lp_hz=180, wA=1.0, wB=1.0, f
         y = filtfilt(b, a, y, padtype="odd", padlen=3*(max(len(a), len(b))-1))
     return y
 
-# =============================================================================
-# Noise helpers
-# =============================================================================
+# ----------------------------- Noise helpers -----------------------------
 
 def pinkish_noise_fft(N, fs, alpha=1.0, f_lo=10, f_hi=400, rng=None):
     rng = np.random.default_rng() if rng is None else rng
@@ -193,26 +224,9 @@ def _noise(N, fs, noise_type, rng, shaper_taps=None):
         return colored_noise_from_shaper(N, shaper_taps, rng=rng)
     return zscore(rng.standard_normal(N))
 
-
-def _snr_noise_sd(signal_sd, snr_db):
-    """Noise SD giving the requested SNR in dB (20*log10 of the SD ratio)."""
-    signal_sd = float(signal_sd)
-    if signal_sd <= 0:
-        return 0.0
-    return signal_sd / (10.0 ** (float(snr_db) / 20.0))
-
-
-def measured_snr_db(signal, noise):
-    s = np.std(np.asarray(signal, float))
-    n = np.std(np.asarray(noise, float))
-    return np.inf if n == 0 else 20.0*np.log10(s/n)
-
-# =============================================================================
-# MUAP templates, force envelope
-# =============================================================================
+# --------------------------- MUAP templates ------------------------------
 
 def generate_muap_shape_dog(dur_s, fs, width_scale=1.0, tri_ratio=0.35, mu_factor=0.0):
-    """Difference-of-Gaussians MUAP template of duration dur_s (peak-normalised)."""
     L = max(16, int(round(dur_s*fs)))
     t = np.linspace(-0.5, 0.5, L)
     s1 = 0.11*width_scale*(1 - 0.25*mu_factor)
@@ -228,8 +242,10 @@ def generate_muap_shape_dog(dur_s, fs, width_scale=1.0, tri_ratio=0.35, mu_facto
     return dog.astype(float)
 
 
+_generate_muap_shape_dog = generate_muap_shape_dog  # v1 alias (identical code)
+
+
 def generate_muap_shape_original(d, dt, tau=0.18):
-    """Alternative biphasic MUAP template of duration d."""
     n = max(2, int(round((d/2)/dt)))
     t = np.linspace(0, d/2, n)
     shape1 = 5*np.sin(np.pi*t/(d/2)) * np.exp((1/tau)*((t/(d/2))-1))
@@ -238,12 +254,9 @@ def generate_muap_shape_original(d, dt, tau=0.18):
 
 
 def force_modulation_sine(t, f, phase=0):
-    """Force envelope in [0, 1]. Use f=0 with phase=pi/2 for a constant envelope."""
     return (np.sin(2*np.pi*f*t + phase) + 1.0)/2.0
 
-# =============================================================================
-# Leaky integrate-and-fire motor-neuron pool
-# =============================================================================
+# ------------------------ Leaky integrate-and-fire ------------------------
 
 def lif_population(Im, group, Vth_base, V_reset, V_e, Rm, tau_m, dt,
                    state=None, adaptation=True,
@@ -259,20 +272,22 @@ def lif_population(Im, group, Vth_base, V_reset, V_e, Rm, tau_m, dt,
     Vth_base : array (n_units,)
         Static threshold of each unit (V).
     state : dict or None
-        {'V', 'Vth', 'since'} returned by a previous call, to continue the
-        integration seamlessly. None = fresh start.
+        {'V', 'Vth', 'since'} carried from a previous call (continuous
+        integration across chunks). None = fresh start (V = V_reset, no
+        adaptation, refractory clock expired).
 
-    Update rule per sample t:
+    Update rule per sample t (identical to v1's lif_window_with_adaptation):
         Vth <- Vth_base + (Vth - Vth_base) * exp(-dt/tau_adapt)
         if t - t_last < min_isi : V[t+1] = V_reset                 (refractory)
         elif V[t] >= Vth        : spike at t, V[t+1] = V_reset, Vth += dVth
         else                    : V[t+1] = V[t] + dt*(-(V[t]-V_e) + Im[t]*Rm)/tau_m
-    With adaptation=False the refractory period and the threshold step are disabled.
+    With adaptation=False the refractory period and the threshold step are
+    disabled (v1's non-adaptive branch).
 
     Returns
     -------
     spikes : bool array (n_units, L)
-    state  : dict for continuing the integration.
+    state  : dict, to pass to the next call for seamless continuation.
     """
     Im = np.atleast_2d(np.asarray(Im, float))
     group = np.asarray(group, int)
@@ -290,9 +305,9 @@ def lif_population(Im, group, Vth_base, V_reset, V_e, Rm, tau_m, dt,
     else:
         min_isi, decay, step = 0, 0.0, 0.0
         Vth = Vb.copy()
-    last = -since
+    last = -since                              # index of the last spike relative to t = 0
     k = dt/tau_m
-    ImT = np.ascontiguousarray(Im.T)
+    ImT = np.ascontiguousarray(Im.T)           # (L, n_groups): fast row access
     spikes = np.zeros((n, L), dtype=bool)
     for t in range(L):
         Vth = Vb + (Vth - Vb)*decay
@@ -311,9 +326,14 @@ def lif_population(Im, group, Vth_base, V_reset, V_e, Rm, tau_m, dt,
 def lif_window_with_adaptation(Im, Vth_base, V_reset, V_e, Rm, tau_m, dt, v_mem_start,
                                min_isi_ms=18.0, dVth=0.003, tau_adapt_ms=250.0,
                                state=None, return_state=False):
-    """Single-unit LIF with threshold adaptation. Pass the `state` returned with
-    return_state=True to continue the same unit across successive calls.
-    Returns (spikes, V_end) or (spikes, V_end, state)."""
+    """Single-unit LIF with threshold adaptation (backward-compatible wrapper).
+
+    v1 restarted the adaptive threshold and refractory clock on every call; the
+    v1 generator called it once per 100-ms window, which produced the window
+    artifact. Pass the `state` returned with return_state=True to continue a
+    unit seamlessly across calls. Returns (spikes, V_end) or
+    (spikes, V_end, state).
+    """
     if state is None:
         state = {'V': np.array([v_mem_start], float), 'Vth': np.array([Vth_base], float),
                  'since': np.array([10**9])}
@@ -323,9 +343,7 @@ def lif_window_with_adaptation(Im, Vth_base, V_reset, V_e, Rm, tau_m, dt, v_mem_
     out = (sp[0].astype(float), float(st['V'][0]))
     return out + (st,) if return_state else out
 
-# =============================================================================
-# Fibre dispersion
-# =============================================================================
+# ------------------------------ Fibre dispersion -------------------------
 
 def simulate_fiber_emg_vectorized(unit_signal, n_fibers, delay_std_samp, rng, amp_mean=1.0, amp_std=0.1):
     L = len(unit_signal)
@@ -343,46 +361,104 @@ def simulate_fiber_emg_vectorized(unit_signal, n_fibers, delay_std_samp, rng, am
         else:       out += a*unit_signal
     return out
 
-# =============================================================================
-# Common drive and intent variability
-# =============================================================================
+# ---------------------------- v3 helpers ---------------------------------
+
+def _require_pycwt():
+    if wavelet is None:
+        raise ImportError(
+            "Wavelet analysis requires the optional dependency 'pycwt'. "
+            "Install dependencies with: pip install -r requirements.txt"
+        )
+
+
+def _snr_noise_sd(signal_sd, snr, units='db'):
+    """Return noise SD required for the requested SNR.
+
+    For dB, SNR_dB = 20*log10(signal_sd/noise_sd), equivalent to the
+    conventional 10*log10 power ratio.  'linear_power' reproduces v1/v2.
+    """
+    signal_sd = float(signal_sd)
+    snr = float(snr)
+    if signal_sd <= 0:
+        return 0.0
+    if units == 'db':
+        return signal_sd / (10.0 ** (snr / 20.0))
+    if units == 'linear_power':
+        if snr <= 0:
+            raise ValueError('linear-power SNR must be > 0')
+        return signal_sd / np.sqrt(snr)
+    raise ValueError("snr_units must be 'db' or 'linear_power'")
+
+
+def measured_snr_db(signal, noise):
+    """Measured RMS/power SNR in dB (utility for validation)."""
+    s = np.std(np.asarray(signal, float))
+    n = np.std(np.asarray(noise, float))
+    return np.inf if n == 0 else 20.0*np.log10(s/n)
+
 
 def compose_common_drive(cortical, subcortical, cortical_weight, subcortical_weight,
-                         target_rms=6.0, fraction_interpretation='amplitude'):
-    """Mix cortical and subcortical common drive at a FIXED total RMS.
+                         target_rms=6.0, normalization='rms',
+                         fraction_interpretation='amplitude'):
+    """Compose cortical/subcortical common drive without a strength confound.
 
-    cortical_weight : subcortical_weight sets the mixture (e.g. 6:0 = 100/0,
-    4.875:1.625 = 75/25, 3.25:3.25 = 50/50); the mixed drive is then scaled to
-    `target_rms`, so changing the mixture changes which frequencies are shared,
-    not how much input is shared.
-
-    fraction_interpretation='amplitude' (default): weights are amplitude
-    weights (75/25 amplitude = ~90/10 in variance for independent sources).
-    'power': weights are variance fractions.
+    Parameters
+    ----------
+    cortical, subcortical : arrays
+        Preferably zero-mean/unit-SD band-limited processes.
+    cortical_weight, subcortical_weight : float
+        Used to infer the mixture fraction.  E.g. 6/0 -> 100/0,
+        4.875/1.625 -> 75/25, 3.25/3.25 -> 50/50.
+    target_rms : float
+        SD/RMS of the *combined* common drive after mixing when
+        normalization='rms'.  6.0 corresponds to 37.5% of an amplitude sum
+        with unique-drive amplitude 10: 6/(10+6)=0.375.
+    normalization : {'rms','legacy_coefficients'}
+        'rms' is the v3 default.  'legacy_coefficients' reproduces v2's direct
+        coefficient multiplication, where total common-drive RMS varies with
+        the mixture.
+    fraction_interpretation : {'amplitude','power'}
+        With 'amplitude', p:(1-p) is the pre-normalization amplitude ratio.
+        With 'power', sqrt(p):sqrt(1-p) is used so p is the intended power
+        fraction before final RMS normalization.
     """
     c = zscore(cortical)
     s = zscore(subcortical)
     cw = abs(float(cortical_weight)); sw = abs(float(subcortical_weight))
     total = cw + sw
     if total <= 0:
-        return np.zeros_like(c), dict(cortical_fraction=np.nan, rms=0.0, coefficients=(0.0, 0.0))
+        return np.zeros_like(c), dict(cortical_fraction=np.nan, rms=0.0,
+                                      coefficients=(0.0, 0.0))
     p = cw / total
+    if normalization == 'legacy_coefficients':
+        out = float(cortical_weight)*c + float(subcortical_weight)*s
+        return out, dict(cortical_fraction=p, rms=float(np.std(out)),
+                         coefficients=(float(cortical_weight), float(subcortical_weight)))
+    if normalization != 'rms':
+        raise ValueError("common_drive_normalization must be 'rms' or 'legacy_coefficients'")
     if fraction_interpretation == 'amplitude':
         a, b = p, 1.0-p
     elif fraction_interpretation == 'power':
         a, b = np.sqrt(p), np.sqrt(1.0-p)
     else:
-        raise ValueError("fraction_interpretation must be 'amplitude' or 'power'")
+        raise ValueError("common_fraction_interpretation must be 'amplitude' or 'power'")
     raw = a*c + b*s
     raw_sd = np.std(raw)
     out = np.zeros_like(raw) if raw_sd <= 1e-15 else raw * (float(target_rms)/raw_sd)
     scale = 0.0 if raw_sd <= 1e-15 else float(target_rms)/raw_sd
-    return out, dict(cortical_fraction=p, rms=float(np.std(out)), coefficients=(a*scale, b*scale))
+    return out, dict(cortical_fraction=p, rms=float(np.std(out)),
+                     coefficients=(a*scale, b*scale))
 
 
 def _bounded_intent_variation(n, fs, rms_fraction, rng, cutoff_hz=0.25, clip_sd=3.0):
-    """Smooth low-frequency (<= cutoff_hz) variation of the drive envelope with the
-    requested fractional RMS (random 5-component Fourier series, detrended)."""
+    """Smooth low-frequency intent variation with requested fractional RMS.
+
+    A short random Fourier series is used instead of filtering near-DC white
+    noise, avoiding numerical/edge instabilities for 5-kHz data.  Five
+    components span roughly one cycle/trial to `cutoff_hz`; the result is
+    linearly detrended, zero-centered, and RMS-normalized.  A final safety clip
+    at `clip_sd` times the target RMS is applied only if needed.
+    """
     n = int(n); rms_fraction = float(rms_fraction); fs = float(fs)
     if rms_fraction <= 0 or n <= 2:
         return np.zeros(n, float)
@@ -406,246 +482,62 @@ def _bounded_intent_variation(n, fs, rms_fraction, rng, cutoff_hz=0.25, clip_sd=
     if limit > 0 and np.max(np.abs(y)) > limit:
         y = np.clip(y, -limit, limit)
         y -= y.mean()
+        # Recover as much target RMS as possible without violating the bound.
         sd = y.std()
         if sd > 0:
             scale = min(rms_fraction/sd, limit/(np.max(np.abs(y)) + 1e-15))
             y *= scale
     return y
 
-# =============================================================================
-# Simulator
-# =============================================================================
 
-def generate_modulated_EMG_physiological_upgraded(
-    motorunits_max=72, n_fibers=346, FreqInputTotal=100, SNR=40, SNRE=40, SNRF=8,
-    V_reset=-0.080, V_e=-0.075, dt=0.0002, T_end=18.0, const_current=10.0,
-    common_mod_subcortical=1.625,
-    freq_left=0.5, freq_right=1.0, phase_left=0.0, phase_right=np.pi/2,
-    Intent_variability=0.01, window_size=None,
-    cross_talk_R2L=0.20, cross_talk_L2R=0.01, common_mod_cortical=4.875,
-    Vth_min=-0.055, Vth_max=-0.040, I_scale=1.5e-9, Rm=10e6, tau_m=10e-3,
-    seed=1234, cortical_high_hz=60,
-    # MUAP
-    use_dog_muaps=True, muap_dur_s=0.018, muap_jitter_s=0.004,
-    mu_gain_low=0.6, mu_gain_high=1.4,
-    # LIF adaptation
-    use_lif_adaptation=True, min_isi_ms=18.0, dVth=0.003, tau_adapt_ms=250.0,
-    # Noise
-    noise_type='pink', shaper_taps_mu=None, shaper_taps_emg=None,
-    # Common drive, duration, intent
-    burn_in_s=1.0, common_drive_target_rms=6.0, common_fraction_interpretation='amplitude',
-    intent_drift='bounded', intent_cutoff_hz=0.25,
-    return_spikes=False, progress=False
-):
-    """Simulate a bilateral (left/right) monopolar EMG pair.
+def preprocess_emg_for_coherence(x, fs, low=5.0, high=499.0,
+                                 detrend=True, taper=None, taper_kwargs=None,
+                                 zscore_output=True):
+    """Prepare non-rectified EMG for coherence analysis.
 
-    Model: each limb receives a unique low-pass drive plus a common drive shared by
-    both limbs (cortical 13-`cortical_high_hz` Hz and subcortical 5-13 Hz components,
-    mixed at fixed total RMS), multiplied by a task force envelope; a fraction of each
-    limb's input is mixed into the other (cross-limb crosstalk). The input drives a
-    pool of leaky integrate-and-fire motor units with threshold adaptation; spike
-    trains are convolved with MUAP templates, dispersed over muscle fibres and
-    summed, and noise is added. All parameters have defaults equal to the
-    representative configuration of the article.
-
-    Key parameters
-    --------------
-    T_end : float        returned duration (s); a separate `burn_in_s` is simulated first
-    dt : float           simulation step (s); fs = 1/dt (default 5 kHz)
-    motorunits_max : int motor units per limb
-    const_current : float  amplitude (SD) of the unique, limb-specific drive
-    common_mod_cortical, common_mod_subcortical : float
-        relative amplitude weights of the cortical/subcortical common drive
-        (6/0 = 100/0, 4.875/1.625 = 75/25, 3.25/3.25 = 50/50)
-    common_drive_target_rms : float  total SD of the common drive (default 6)
-    cortical_high_hz : float  upper cut-off of the cortical band (30 or 60)
-    cross_talk_R2L, cross_talk_L2R : float in [0, 1]
-        fraction of the other limb's input mixed into each limb
-    freq_left, freq_right, phase_left, phase_right : force-envelope sinusoids
-        (default 1:2 bimanual task, 0.5 and 1.0 Hz); use freq=0, phase=pi/2 for a
-        constant envelope (isometric task)
-    Intent_variability : float  fractional RMS of slow (<0.25 Hz) envelope variation
-    SNR, SNRF, SNRE : float     SNR in dB of drive noise, MU-level noise, EMG noise
-    Vth_min, Vth_max, V_reset, V_e, Rm, tau_m, I_scale : LIF parameters
-    min_isi_ms, dVth, tau_adapt_ms : refractory period and threshold adaptation
-    muap_dur_s, muap_jitter_s : mean MUAP duration and per-MU uniform jitter (s)
-    mu_gain_low, mu_gain_high : MUAP amplitude ramp across the pool
-    n_fibers : int              fibres per motor unit (temporal dispersion)
-    noise_type : 'pink' | 'white' | 'shaped'
-    seed : int                  identical seeds give identical outputs
-    window_size : ignored (kept for compatibility with earlier scripts)
-
-    Returns
-    -------
-    EMG_L, EMG_R, fs            monopolar EMG (use simulate_bipolar_emg_spatial for
-                                surface bipolar signals)
-    info (if return_spikes=True) dict with spike trains ('spikes_L', 'spikes_R',
-                                bool n_MU x n_samples), MUAP durations, gains, and
-                                common-drive metadata.
+    Detrending is explicit and enabled by default. ``taper`` may be None,
+    ``'matviyenko'``, ``'tukey'``, a callable returning a length-N window, or
+    a length-N array.  For ``'matviyenko'``, pass ``taper_kwargs={'K': ...}``.
+    The exact supplied MATLAB coefficients are used. In V3.3 the primary
+    analysis uses no full-record taper; Matviyenko K is a sensitivity parameter
+    because the historical call site specifying K was not supplied.
     """
-    if dt <= 0 or T_end <= 0:
-        raise ValueError('dt and T_end must be positive')
-    if not (0 <= cross_talk_R2L <= 1 and 0 <= cross_talk_L2R <= 1):
-        raise ValueError('cross-talk coefficients must lie in [0,1]')
-    if cortical_high_hz <= 13:
-        raise ValueError('cortical_high_hz must be > 13 Hz')
-    fs = 1.0/dt
-    if cortical_high_hz >= fs/2:
-        raise ValueError('cortical_high_hz must be below Nyquist')
+    y = np.asarray(x, float)
+    y = bandpass_emg(y, fs, low=low, high=min(high, fs/2.0-1e-6))
+    if detrend:
+        y = scipy_detrend(y, type='linear')
+    if taper is not None:
+        kw = {} if taper_kwargs is None else dict(taper_kwargs)
+        if isinstance(taper, str):
+            taper_name = taper.lower()
+            if taper_name == 'matviyenko':
+                K = int(kw.pop('K', 8))
+                if kw:
+                    raise TypeError(f"Unexpected Matviyenko taper kwargs: {sorted(kw)}")
+                w = matviyenko_window(y.size, K=K)
+            elif taper_name == 'tukey':
+                w = signal_windows.tukey(y.size, alpha=float(kw.pop('alpha', 0.1)))
+                if kw:
+                    raise TypeError(f"Unexpected Tukey taper kwargs: {sorted(kw)}")
+            else:
+                raise ValueError("Unknown taper. Use None, 'matviyenko', 'tukey', callable, or an array.")
+        elif callable(taper):
+            w = np.asarray(taper(y.size, **kw), float)
+        else:
+            w = np.asarray(taper, float)
+        if w.shape != y.shape:
+            raise ValueError('taper must have the same length as the signal')
+        y = y*w
+    return zscore(y) if zscore_output else y
 
-    n_out = int(round(float(T_end)/dt))
-    n_burn = int(round(max(float(burn_in_s), 0.0)/dt))
-    N = n_burn + n_out
-    T = (np.arange(N) - n_burn)*dt          # t = 0 is the first returned sample
-    nMU = int(motorunits_max)
-    if nMU < 1:
-        raise ValueError('motorunits_max must be >= 1')
-
-    # Independent, reproducible random streams for each stage.
-    ss = np.random.SeedSequence(seed)
-    (ss_shared, ss_drive, ss_intent, ss_muap, ss_munoise,
-     ss_fiber, ss_emgnoise) = ss.spawn(7)
-    rng_shared = np.random.default_rng(ss_shared)
-    rng_drive = np.random.default_rng(ss_drive)
-    rng_intent = np.random.default_rng(ss_intent)
-
-    def band_limited_unit(length, low, high, rng):
-        x = rng.standard_normal(length)
-        x = butter_filter_low(x, high, fs)
-        x = butter_filter_high(x, low, fs)
-        return zscore(x)
-
-    # Common drive (shared by both limbs)
-    cort_z = band_limited_unit(N, 13, cortical_high_hz, rng_shared)
-    sub_z = band_limited_unit(N, 5, 13, rng_shared)
-    common, common_meta = compose_common_drive(
-        cort_z, sub_z, common_mod_cortical, common_mod_subcortical,
-        target_rms=common_drive_target_rms,
-        fraction_interpretation=common_fraction_interpretation)
-
-    # Task envelopes: shared 0.2-2 Hz fluctuation + limb-specific slow intent variation
-    envn = 0.15*band_limited_unit(N, 0.2, 2.0, rng_shared)
-    force_L = force_modulation_sine(T, freq_left, phase_left)
-    force_R = force_modulation_sine(T, freq_right, phase_right)
-    if intent_drift == 'bounded':
-        drift_L = _bounded_intent_variation(N, fs, Intent_variability, rng_intent,
-                                            cutoff_hz=intent_cutoff_hz)
-        drift_R = _bounded_intent_variation(N, fs, Intent_variability, rng_intent,
-                                            cutoff_hz=intent_cutoff_hz)
-    elif intent_drift == 'none':
-        drift_L = drift_R = np.zeros(N)
-    else:
-        raise ValueError("intent_drift must be 'bounded' or 'none'")
-    fL = force_L*(1.0 + envn + drift_L)
-    fR = force_R*(1.0 + envn + drift_R)
-
-    # Unique drive + common drive + drive noise
-    uL = zscore(butter_filter_low(rng_drive.standard_normal(N), FreqInputTotal, fs))
-    uR = zscore(butter_filter_low(rng_drive.standard_normal(N), FreqInputTotal, fs))
-    sigL = const_current*uL + common
-    sigR = const_current*uR + common
-    nL0 = zscore(rng_drive.standard_normal(N))
-    nR0 = zscore(rng_drive.standard_normal(N))
-    nL = nL0*_snr_noise_sd(np.std(sigL), SNR)
-    nR = nR0*_snr_noise_sd(np.std(sigR), SNR)
-    ImL0 = I_scale*(sigL + nL)*fL
-    ImR0 = I_scale*(sigR + nR)*fR
-
-    # Cross-limb crosstalk (convex mixing)
-    ImL = (1.0-cross_talk_R2L)*ImL0 + cross_talk_R2L*ImR0
-    ImR = (1.0-cross_talk_L2R)*ImR0 + cross_talk_L2R*ImL0
-
-    # Motor-neuron pools, both limbs, continuous integration over burn-in + data
-    Th = np.linspace(Vth_min, Vth_max, nMU)
-    spikes, _ = lif_population(
-        np.vstack([ImL, ImR]),
-        np.r_[np.zeros(nMU, int), np.ones(nMU, int)],
-        np.r_[Th, Th], V_reset, V_e, Rm, tau_m, dt,
-        adaptation=use_lif_adaptation, min_isi_ms=min_isi_ms,
-        dVth=dVth, tau_adapt_ms=tau_adapt_ms)
-    spL, spR = spikes[:nMU], spikes[nMU:]
-
-    # MUAP synthesis, MU-level noise, fibre dispersion
-    rng_muap = np.random.default_rng(ss_muap)
-    durs = muap_dur_s + rng_muap.uniform(-muap_jitter_s, muap_jitter_s, nMU)
-    gains = np.linspace(mu_gain_low, mu_gain_high, nMU)
-    rng_mun = np.random.default_rng(ss_munoise)
-    fiber_ss = ss_fiber.spawn(2*nMU)
-    EMG_L = np.zeros(N); EMG_R = np.zeros(N)
-    it = tqdm(range(nMU), desc='MUAPs', leave=False) if progress else range(nMU)
-    for i in it:
-        mu_factor = i/(nMU-1 + 1e-12)
-        shape = (generate_muap_shape_dog(durs[i], fs, mu_factor=mu_factor)
-                 if use_dog_muaps else generate_muap_shape_original(durs[i], dt))
-        for side, sp, EMG in ((0, spL[i], EMG_L), (1, spR[i], EMG_R)):
-            conv = np.convolve(sp.astype(float), shape, mode='same')*gains[i]
-            sd = np.std(conv)
-            if sd > 0:
-                nz = _noise(N, fs, noise_type, rng_mun, shaper_taps_mu)
-                conv += nz*_snr_noise_sd(sd, SNRF)
-            rng_f = np.random.default_rng(fiber_ss[2*i + side])
-            EMG += simulate_fiber_emg_vectorized(conv, n_fibers, delay_std_samp=1, rng=rng_f)
-
-    # Discard burn-in, add EMG-level noise
-    EMG_L = EMG_L[n_burn:n_burn+n_out]
-    EMG_R = EMG_R[n_burn:n_burn+n_out]
-    rng_e = np.random.default_rng(ss_emgnoise)
-
-    def add_emg_noise(x):
-        sd = np.std(x)
-        if sd <= 0:
-            return x
-        nz = _noise(x.size, fs, noise_type, rng_e, shaper_taps_emg)
-        return x + nz*_snr_noise_sd(sd, SNRE)
-
-    EMG_L = add_emg_noise(EMG_L)
-    EMG_R = add_emg_noise(EMG_R)
-
-    if return_spikes:
-        info = dict(
-            spikes_L=spL[:, n_burn:n_burn+n_out],
-            spikes_R=spR[:, n_burn:n_burn+n_out],
-            muap_dur_s=durs, gains=gains,
-            burn_in_s=n_burn*dt, duration_s=n_out*dt,
-            common_drive_rms=common_meta['rms'],
-            common_cortical_fraction=common_meta['cortical_fraction'],
-            common_effective_coefficients=common_meta['coefficients'],
-            drive_noise_snr_db_L=measured_snr_db(sigL, nL),
-            drive_noise_snr_db_R=measured_snr_db(sigR, nR),
-        )
-        return EMG_L, EMG_R, fs, info
-    return EMG_L, EMG_R, fs
-
-
-def simulate_bilateral_emg(seed=1234, bipolar=True, fs_out=None, **params):
-    """Convenience wrapper: simulate a left/right EMG pair with the article's
-    representative configuration (1:2 bimanual task, 75/25 cortical/subcortical
-    common drive, cortical band 13-60 Hz, 20 % right-to-left crosstalk, 72 motor
-    units per limb, 18 s). Any argument of
-    generate_modulated_EMG_physiological_upgraded can be overridden via **params.
-
-    bipolar : return surface bipolar signals (default) instead of monopolar
-    fs_out  : resample the output to this rate (e.g. 1000.0); None keeps 1/dt
-
-    Returns left, right, fs  (plus info if return_spikes=True).
-    """
-    out = generate_modulated_EMG_physiological_upgraded(seed=seed, **params)
-    L, R, fs = out[:3]
-    if bipolar:
-        L = simulate_bipolar_emg_spatial(L, fs, tau_ms=1.2, lp_hz=180.0)
-        R = simulate_bipolar_emg_spatial(R, fs, tau_ms=1.2, lp_hz=180.0)
-    if fs_out is not None:
-        L = resample_to_fs(L, fs, fs_out); R = resample_to_fs(R, fs, fs_out); fs = float(fs_out)
-    return (L, R, fs) + tuple(out[3:])
-
-# =============================================================================
-# Preprocessing for coherence
-# =============================================================================
 
 def apply_analysis_taper(x, taper=None, taper_kwargs=None, zscore_output=True):
-    """Optional taper applied to a copy of an already preprocessed signal.
-    taper: None (default), 'matviyenko' (taper_kwargs={'K': 2..13}), 'tukey'
-    (taper_kwargs={'alpha': ...}), a callable returning a length-N window, or an array."""
+    """Apply an optional analysis-only taper to an already preprocessed signal.
+
+    ``x`` is expected to have already been filtered/detrended for coherence.
+    V3.3 primary analysis passes ``taper=None``. Matviyenko/Tukey are retained
+    for sensitivity analyses. This helper never mutates the input array.
+    """
     y = np.asarray(x, float).copy()
     if taper is not None:
         kw = {} if taper_kwargs is None else dict(taper_kwargs)
@@ -672,33 +564,262 @@ def apply_analysis_taper(x, taper=None, taper_kwargs=None, zscore_output=True):
     return zscore(y) if zscore_output else y
 
 
-def preprocess_emg_for_coherence(x, fs, low=5.0, high=499.0, detrend=True,
-                                 notch_hz=None, notch_harmonics=3,
-                                 taper=None, taper_kwargs=None, zscore_output=True):
-    """Prepare NON-rectified EMG for wavelet coherence: optional power-line notch
-    (notch_hz = 50 or 60), band-pass `low`-`high` Hz (4th-order zero-phase
-    Butterworth), linear detrend, optional taper (default none) and z-score."""
-    y = np.asarray(x, float)
-    if notch_hz is not None:
-        y = notch_filter(y, fs, f0=notch_hz, harmonics=notch_harmonics)
-    y = bandpass_emg(y, fs, low=low, high=min(high, fs/2.0-1e-6))
-    if detrend:
-        y = scipy_detrend(y, type='linear')
-    return apply_analysis_taper(y, taper=taper, taper_kwargs=taper_kwargs,
-                                zscore_output=zscore_output)
+def random_derangement(n, rng=None):
+    """Return a random permutation of ``range(n)`` with no fixed points.
 
-# =============================================================================
-# Wavelet coherence (Morlet; Torrence & Compo 1998; Grinsted et al. 2004)
-# =============================================================================
+    Used by V3.3 same-condition cross-trial null inference. For n < 2 no
+    derangement exists and a ValueError is raised.
+    """
+    n = int(n)
+    if n < 2:
+        raise ValueError('a derangement requires at least two trials')
+    rng = np.random.default_rng() if rng is None else rng
+    base = np.arange(n)
+    # Rejection is efficient for the small trial counts used here (n=15).
+    for _ in range(10000):
+        p = rng.permutation(n)
+        if np.all(p != base):
+            return p
+    # Guaranteed fallback: a non-zero cyclic shift is always a derangement.
+    shift = int(rng.integers(1, n))
+    return np.roll(base, shift)
 
-def _require_pycwt():
-    if wavelet is None:
-        raise ImportError("Wavelet analysis requires 'pycwt' (pip install -r requirements.txt).")
 
+def phase_randomize(x, rng=None):
+    """Plain Fourier phase-randomized surrogate preserving the periodogram.
+
+    This is *not* IAAFT. In V3.3 it is retained only for legacy/diagnostic
+    comparisons; it is not the primary significance/null procedure because it
+    destroys the task-locked burst/nonstationary structure of the EMG.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    x = np.asarray(x, float)
+    X = np.fft.rfft(x)
+    mag = np.abs(X)
+    phase = np.angle(X)
+    if X.size > 2:
+        hi = X.size-1 if x.size % 2 == 0 else X.size
+        phase[1:hi] = rng.uniform(0.0, 2*np.pi, hi-1)
+    Y = mag*np.exp(1j*phase)
+    # preserve real DC and Nyquist bins
+    Y[0] = X[0].real + 0j
+    if x.size % 2 == 0 and Y.size > 1:
+        Y[-1] = X[-1].real + 0j
+    return np.fft.irfft(Y, n=x.size)
+
+# --------------------- Minimal physiological simulator -------------------
+
+def generate_modulated_EMG_physiological_upgraded(
+    motorunits_max, n_fibers, FreqInputTotal, SNR, SNRE, SNRF,
+    V_reset, V_e, dt, T_end, const_current, common_mod_subcortical,
+    freq_left, freq_right, phase_left, phase_right, Intent_variability, window_size,
+    cross_talk_R2L, cross_talk_L2R, common_mod_cortical,
+    Vth_min, Vth_max, I_scale, Rm, tau_m, seed=1234, cortical_high_hz=30,
+    # MUAP
+    use_dog_muaps=True, muap_dur_s=0.015, muap_jitter_s=0.004,
+    mu_gain_low=0.6, mu_gain_high=1.4,
+    # LIF adaptation
+    use_lif_adaptation=True, min_isi_ms=18.0, dVth=0.003, tau_adapt_ms=250.0,
+    # Noise
+    noise_type='pink', shaper_taps_mu=None, shaper_taps_emg=None,
+    # v3 options
+    snr_units='db', burn_in_s=1.0,
+    common_drive_normalization='rms', common_drive_target_rms=6.0,
+    common_fraction_interpretation='amplitude',
+    intent_drift='bounded', intent_cutoff_hz=0.25,
+    return_spikes=False, progress=False
+):
+    """Simulate bilateral monopolar EMG with a continuously integrated LIF pool.
+
+    Version 3 defaults intentionally differ from v2 in four scientific places:
+    (1) the combined common drive is normalized to a fixed RMS across cortical /
+    subcortical mixtures; (2) SNR values are dB; (3) T_end is the *returned*
+    usable duration, with a separate burn-in; and (4) Intent_variability is a
+    bounded low-frequency fractional RMS rather than an unbounded %/s ramp.
+
+    To approximate v2 behavior use::
+
+        snr_units='linear_power', burn_in_s=0.0,
+        common_drive_normalization='legacy_coefficients',
+        intent_drift='linear_per_second'
+
+    The old v2 implementation itself is preserved in legacy/v2/functions_v2.py.
+
+    Parameters retained from v2 keep their meaning unless overridden above.
+    `common_mod_cortical` and `common_mod_subcortical` now primarily determine
+    the mixture ratio when common_drive_normalization='rms'.  For example,
+    6/0 -> 100/0, 4.875/1.625 -> 75/25, and 3.25/3.25 -> 50/50.  The final
+    combined common-drive SD is `common_drive_target_rms` for every mixture.
+
+    `fraction_interpretation='amplitude'` matches the manuscript's coefficient
+    language.  Set it to 'power' if 75/25 should mean 75/25 variance contribution.
+
+    Returns EMG_L, EMG_R, fs.  With return_spikes=True a fourth `info` dict is
+    returned with spike trains, exact common-drive metadata, duration/burn-in,
+    and the effective SNR interpretation.
+    """
+    if dt <= 0 or T_end <= 0:
+        raise ValueError('dt and T_end must be positive')
+    if not (0 <= cross_talk_R2L <= 1 and 0 <= cross_talk_L2R <= 1):
+        raise ValueError('cross-talk coefficients must lie in [0,1]')
+    if cortical_high_hz <= 13:
+        raise ValueError('cortical_high_hz must be > 13 Hz')
+    fs = 1.0/dt
+    if cortical_high_hz >= fs/2:
+        raise ValueError('cortical_high_hz must be below Nyquist')
+
+    n_out = int(round(float(T_end)/dt))
+    n_burn = int(round(max(float(burn_in_s), 0.0)/dt))
+    N = n_burn + n_out
+    # t=0 corresponds exactly to the first returned sample after burn-in.
+    T = (np.arange(N) - n_burn)*dt
+    nMU = int(motorunits_max)
+    if nMU < 1:
+        raise ValueError('motorunits_max must be >= 1')
+
+    # Independent deterministic streams by simulation stage.
+    ss = np.random.SeedSequence(seed)
+    (ss_shared, ss_drive, ss_intent, ss_muap, ss_munoise,
+     ss_fiber, ss_emgnoise) = ss.spawn(7)
+    rng_shared = np.random.default_rng(ss_shared)
+    rng_drive = np.random.default_rng(ss_drive)
+    rng_intent = np.random.default_rng(ss_intent)
+
+    def band_limited_unit(length, low, high, rng):
+        x = rng.standard_normal(length)
+        x = butter_filter_low(x, high, fs)
+        x = butter_filter_high(x, low, fs)
+        return zscore(x)
+
+    cort_z = band_limited_unit(N, 13, cortical_high_hz, rng_shared)
+    sub_z = band_limited_unit(N, 5, 13, rng_shared)
+    common, common_meta = compose_common_drive(
+        cort_z, sub_z, common_mod_cortical, common_mod_subcortical,
+        target_rms=common_drive_target_rms,
+        normalization=common_drive_normalization,
+        fraction_interpretation=common_fraction_interpretation)
+
+    # Keep the v2 shared 0.2-2 Hz envelope modulation as part of the published
+    # architecture; v3 changes only the separate Intent_variability term.
+    envn = 0.15*band_limited_unit(N, 0.2, 2.0, rng_shared)
+    force_L = force_modulation_sine(T, freq_left, phase_left)
+    force_R = force_modulation_sine(T, freq_right, phase_right)
+
+    if intent_drift == 'bounded':
+        drift_L = _bounded_intent_variation(N, fs, Intent_variability, rng_intent,
+                                            cutoff_hz=intent_cutoff_hz)
+        drift_R = _bounded_intent_variation(N, fs, Intent_variability, rng_intent,
+                                            cutoff_hz=intent_cutoff_hz)
+    elif intent_drift == 'linear_per_second':
+        drift_L = drift_R = Intent_variability*T
+    elif intent_drift == 'window_legacy':
+        wsamp = max(1, int(round(window_size/dt)))
+        d = Intent_variability*(np.arange(N) % wsamp)*dt
+        drift_L = drift_R = d
+    elif intent_drift == 'none':
+        drift_L = drift_R = np.zeros(N)
+    else:
+        raise ValueError("intent_drift must be 'bounded', 'linear_per_second', "
+                         "'window_legacy', or 'none'")
+
+    fL = force_L*(1.0 + envn + drift_L)
+    fR = force_R*(1.0 + envn + drift_R)
+
+    # Unique limb-specific broadband drive + fixed-magnitude common drive.
+    uL = zscore(butter_filter_low(rng_drive.standard_normal(N), FreqInputTotal, fs))
+    uR = zscore(butter_filter_low(rng_drive.standard_normal(N), FreqInputTotal, fs))
+    sigL = const_current*uL + common
+    sigR = const_current*uR + common
+    nL0 = zscore(rng_drive.standard_normal(N))
+    nR0 = zscore(rng_drive.standard_normal(N))
+    nL = nL0*_snr_noise_sd(np.std(sigL), SNR, snr_units)
+    nR = nR0*_snr_noise_sd(np.std(sigR), SNR, snr_units)
+    ImL0 = I_scale*(sigL + nL)*fL
+    ImR0 = I_scale*(sigR + nR)*fR
+
+    # Source-level cross-limb mixing. Convex mixing keeps overall scaling stable.
+    ImL = (1.0-cross_talk_R2L)*ImL0 + cross_talk_R2L*ImR0
+    ImR = (1.0-cross_talk_L2R)*ImR0 + cross_talk_L2R*ImL0
+
+    # LIF pool, both limbs, one continuous integration over burn-in + data.
+    Th = np.linspace(Vth_min, Vth_max, nMU)
+    spikes, _ = lif_population(
+        np.vstack([ImL, ImR]),
+        np.r_[np.zeros(nMU, int), np.ones(nMU, int)],
+        np.r_[Th, Th], V_reset, V_e, Rm, tau_m, dt,
+        adaptation=use_lif_adaptation, min_isi_ms=min_isi_ms,
+        dVth=dVth, tau_adapt_ms=tau_adapt_ms)
+    spL, spR = spikes[:nMU], spikes[nMU:]
+
+    # MUAP synthesis: one duration/MU; full-trial convolution; seeded noise/fibres.
+    rng_muap = np.random.default_rng(ss_muap)
+    durs = muap_dur_s + rng_muap.uniform(-muap_jitter_s, muap_jitter_s, nMU)
+    gains = np.linspace(mu_gain_low, mu_gain_high, nMU)
+    rng_mun = np.random.default_rng(ss_munoise)
+    fiber_ss = ss_fiber.spawn(2*nMU)
+    EMG_L = np.zeros(N); EMG_R = np.zeros(N)
+    it = tqdm(range(nMU), desc='MUAPs', leave=False) if progress else range(nMU)
+    for i in it:
+        mu_factor = i/(nMU-1 + 1e-12)
+        shape = (generate_muap_shape_dog(durs[i], fs, mu_factor=mu_factor)
+                 if use_dog_muaps else generate_muap_shape_original(durs[i], dt))
+        for side, sp, EMG in ((0, spL[i], EMG_L), (1, spR[i], EMG_R)):
+            conv = np.convolve(sp.astype(float), shape, mode='same')*gains[i]
+            sd = np.std(conv)
+            if sd > 0:
+                nz = _noise(N, fs, noise_type, rng_mun, shaper_taps_mu)
+                conv += nz*_snr_noise_sd(sd, SNRF, snr_units)
+            rng_f = np.random.default_rng(fiber_ss[2*i + side])
+            EMG += simulate_fiber_emg_vectorized(
+                conv, n_fibers, delay_std_samp=1, rng=rng_f)
+
+    # Remove burn-in *after* all dynamical/EMG processing, then add output noise.
+    EMG_L = EMG_L[n_burn:n_burn+n_out]
+    EMG_R = EMG_R[n_burn:n_burn+n_out]
+    rng_e = np.random.default_rng(ss_emgnoise)
+
+    def add_emg_noise(x):
+        sd = np.std(x)
+        if sd <= 0:
+            return x
+        nz = _noise(x.size, fs, noise_type, rng_e, shaper_taps_emg)
+        return x + nz*_snr_noise_sd(sd, SNRE, snr_units)
+
+    EMG_L = add_emg_noise(EMG_L)
+    EMG_R = add_emg_noise(EMG_R)
+    if EMG_L.size != n_out or EMG_R.size != n_out:
+        raise RuntimeError('internal duration error')
+
+    if return_spikes:
+        info = dict(
+            spikes_L=spL[:, n_burn:n_burn+n_out],
+            spikes_R=spR[:, n_burn:n_burn+n_out],
+            muap_dur_s=durs, gains=gains,
+            burn_in_samples=n_burn, burn_in_s=n_burn*dt,
+            duration_samples=n_out, duration_s=n_out*dt,
+            common_drive_rms=common_meta['rms'],
+            common_cortical_fraction=common_meta['cortical_fraction'],
+            common_effective_coefficients=common_meta['coefficients'],
+            common_drive_normalization=common_drive_normalization,
+            common_fraction_interpretation=common_fraction_interpretation,
+            snr_units=snr_units, intent_drift=intent_drift,
+            drive_noise_snr_db_L=measured_snr_db(sigL, nL),
+            drive_noise_snr_db_R=measured_snr_db(sigR, nR),
+        )
+        return EMG_L, EMG_R, fs, info
+    return EMG_L, EMG_R, fs
+
+# ------------------------- Wavelet coherence core ------------------------
 
 def smoothwavelet(wave, dt, period, dj, scale):
-    """Smoothing operator for wavelet coherence: Gaussian along time (width
-    proportional to scale) and a 0.6-octave boxcar along scale (Morlet)."""
+    """Torrence & Webster / Grinsted smoothing used for wavelet coherence:
+    Gaussian along TIME (width proportional to each scale), then a boxcar of
+    0.6 octave along SCALE (Morlet).
+
+    v1 bugs fixed here: (i) the boxcar was applied along time
+    (kernel[np.newaxis, :]) instead of scale; (ii) np.real() discarded the
+    imaginary part of complex inputs (the cross-spectrum).
+    """
     wave = np.asarray(wave)
     if wave.ndim != 2:
         raise ValueError("wave must be a 2-D (scale, time) array")
@@ -720,10 +841,12 @@ def smoothwavelet(wave, dt, period, dj, scale):
 
 
 def _wct_from_cwt(X, Y, scales, dt, dj):
+    """Squared wavelet coherence from two CWTs on the same grid."""
     sinv = 1.0/scales
-    sX = smoothwavelet(sinv[:, None]*(np.abs(X)**2), dt, None, dj, scales)
-    sY = smoothwavelet(sinv[:, None]*(np.abs(Y)**2), dt, None, dj, scales)
-    sWxy = smoothwavelet(sinv[:, None]*(X*np.conj(Y)), dt, None, dj, scales)
+    period = None
+    sX = smoothwavelet(sinv[:, None]*(np.abs(X)**2), dt, period, dj, scales)
+    sY = smoothwavelet(sinv[:, None]*(np.abs(Y)**2), dt, period, dj, scales)
+    sWxy = smoothwavelet(sinv[:, None]*(X*np.conj(Y)), dt, period, dj, scales)
     with np.errstate(divide="ignore", invalid="ignore"):
         Rsq = np.abs(sWxy)**2/(sX*sY)
     Rsq = np.clip(np.real(Rsq), 0.0, 1.0)
@@ -731,23 +854,20 @@ def _wct_from_cwt(X, Y, scales, dt, dj):
     return Rsq
 
 
-def _default_J(fs, dj, s0, w0, fmin):
-    """Number of scales so that the lowest analysed frequency is <= fmin."""
-    fourier_factor = 4*np.pi/(w0 + np.sqrt(2 + w0**2))
-    f_top = 1.0/(fourier_factor*s0)
-    return int(np.ceil(np.log2(f_top/float(fmin))/dj))
+def compute_cwt_for_coherence(sig, fs, fmax=128.0, dj=1/8, s0=None, J=None, w0=6):
+    """Compute and cache the Morlet CWT ingredients used for coherence.
 
-
-def compute_cwt_for_coherence(sig, fs, fmax=128.0, dj=1/8, s0=None, J=None, w0=6, fmin=4.0):
-    """Morlet CWT of one signal, packaged for coherence_from_cached_cwts
-    (lets many pairings reuse the same transform)."""
+    This public helper lets the V3.3 cross-trial null reuse each trial's CWT
+    rather than recomputing the transform for every off-diagonal L/R pairing.
+    The returned dictionary is compatible with ``coherence_from_cached_cwts``.
+    """
     sig = np.asarray(sig, float)
     if sig.ndim != 1:
         raise ValueError('sig must be a 1-D array')
     dt = 1.0/float(fs)
     if s0 is None:
         s0 = dt
-    J = _default_J(fs, dj, s0, w0, fmin) if J is None else int(J)
+    J = int(round(8/dj)) if J is None else int(J)
     _require_pycwt()
     mother = wavelet.Morlet(w0)
     W, scales, freqs_full, coi, *_ = wavelet.cwt(sig, dt, dj, s0, J, mother)
@@ -761,9 +881,12 @@ def compute_cwt_for_coherence(sig, fs, fmax=128.0, dj=1/8, s0=None, J=None, w0=6
 
 
 def coherence_from_cached_cwts(left, right):
-    """Squared wavelet coherence from two outputs of compute_cwt_for_coherence.
-    Returns freqs, period, coi, Rsq (n_freqs x n_times)."""
-    for key in ('dt', 'dj', 's0', 'J', 'w0', 'fs'):
+    """Squared wavelet coherence from two cached CWT dictionaries.
+
+    The two transforms must use the same time/frequency grid. Returns the same
+    core arrays used by ``band_medians``: ``freqs, period, coi, Rsq``.
+    """
+    for key in ('dt','dj','s0','J','w0','fs'):
         if not np.isclose(left[key], right[key]):
             raise ValueError(f'CWT grids differ ({key})')
     if not np.allclose(left['scales'], right['scales']):
@@ -776,162 +899,138 @@ def coherence_from_cached_cwts(left, right):
     return left['freqs'], left['period'], coi, Rsq_full[m, :]
 
 
-def compute_wavelet_coherence(sig1, sig2, fs, fmax=128.0, dj=1/8, s0=None, J=None, w0=6, fmin=4.0):
-    """Squared Morlet wavelet coherence of two equal-length signals.
+def compute_wavelet_coherence(sig1, sig2, fs, fmax=128.0, dj=1/8, s0=None, J=None, w0=6):
+    """Squared Morlet wavelet coherence (Grinsted et al. 2004) of two signals.
 
-    Inputs should be preprocessed (preprocess_emg_for_coherence). Frequencies from
-    about `fmin` to `fmax` Hz are analysed (dj = scale resolution in octaves).
-
-    Returns freqs, period, coi, Rsq, dt, dj, s0, J, mother
-        Rsq has shape (len(freqs), len(sig1)); coi is the cone of influence (in
-        period units) for each time sample. Summarise with
-        band_medians(Rsq, freqs, period=period, coi=coi).
+    Returns freqs, period, coi, Rsq (n_freqs x n_times, masked to <= fmax),
+    dt, dj, s0, J, mother. Defaults (s0 = dt, J = 8/dj) match v1, so the
+    frequency grid is unchanged. Use band_medians(Rsq, freqs, period=period,
+    coi=coi) to exclude the cone of influence.
     """
     sig1 = np.asarray(sig1, float); sig2 = np.asarray(sig2, float)
     if sig1.ndim != 1 or sig1.shape != sig2.shape:
         raise ValueError('sig1 and sig2 must be equal-length 1-D arrays')
-    L = compute_cwt_for_coherence(sig1, fs, fmax=fmax, dj=dj, s0=s0, J=J, w0=w0, fmin=fmin)
-    R = compute_cwt_for_coherence(sig2, fs, fmax=fmax, dj=dj, s0=s0, J=J, w0=w0, fmin=fmin)
+    L = compute_cwt_for_coherence(sig1, fs, fmax=fmax, dj=dj, s0=s0, J=J, w0=w0)
+    R = compute_cwt_for_coherence(sig2, fs, fmax=fmax, dj=dj, s0=s0, J=J, w0=w0)
     freqs, period, coi, Rsq = coherence_from_cached_cwts(L, R)
     return freqs, period, coi, Rsq, L['dt'], L['dj'], L['s0'], L['J'], L['mother']
 
+# ------------------------ Monte-Carlo null (with PB) ---------------------
 
-def band_medians(Rsq, freqs, bands=DEFAULT_BANDS, period=None, coi=None):
-    """Median squared coherence in each frequency band.
+def mc_null_threshold(sig_len, dt, dj, s0, J, mother,
+                      alpha=0.05, num_simulations=300,
+                      bp_low=5.0, bp_high=499.0,
+                      fmax=128.0, rng=None, coi_mask=False):
+    """Legacy v2 Gaussian-null frequency-median threshold.
 
-    Pass `period` and `coi` (from compute_wavelet_coherence) to use only
-    time-frequency points inside the cone of influence (recommended).
-    Returns a dict {'5-13': value, ...}.
+    Kept only for backward compatibility. V3.3 primary inference uses
+    same-condition cross-trial pairing/derangements (see trial_shuffle_null_v3.py).
     """
-    Rsq = np.asarray(Rsq, float)
-    freqs = np.asarray(freqs, float)
-    if Rsq.ndim != 2 or Rsq.shape[0] != freqs.size:
-        raise ValueError("Rsq must have shape (len(freqs), n_times)")
-    use_coi = period is not None and coi is not None
-    if use_coi:
-        period = np.asarray(period, float)
-        coi = np.asarray(coi, float)
-        if period.size != freqs.size or coi.size != Rsq.shape[1]:
-            raise ValueError("period/coi dimensions do not match Rsq")
-    out = {}
-    for (f0, f1) in bands:
-        idx = np.where((freqs >= f0) & (freqs < f1))[0]
-        if idx.size == 0:
-            out[f"{f0}-{f1}"] = np.nan
-            continue
-        values = Rsq[idx, :]
-        values = values[period[idx, None] <= coi[None, :]] if use_coi else values.ravel()
-        values = values[np.isfinite(values)]
-        out[f"{f0}-{f1}"] = float(np.median(values)) if values.size else np.nan
-    return out
-
-def plot_coherence_map(Rsq, freqs, period, coi, fs, path=None, title="Wavelet coherence"):
-    """Time-frequency coherence map with the cone of influence (outside shaded).
-    Saves to `path` if given; returns the matplotlib figure."""
-    import matplotlib.pyplot as plt
-    t = np.arange(Rsq.shape[1])/fs
-    fig, ax = plt.subplots(figsize=(12, 5))
-    cf = ax.contourf(t, np.log2(period), Rsq, levels=np.linspace(0, 1, 41), cmap="jet", vmin=0, vmax=1)
-    ax.plot(t, np.log2(coi), "k", lw=2, label="cone of influence")
-    ax.fill_between(t, np.log2(coi), np.log2(period.max()), color="w", alpha=0.4)
-    ticks = np.array([100, 60, 30, 13, 5])
-    ax.set_yticks(np.log2(1.0/ticks)); ax.set_yticklabels(ticks)
-    ax.set_ylim(np.log2(1/4.0), np.log2(1/min(100.0, freqs.max())))
-    ax.set_xlabel("Time (s)"); ax.set_ylabel("Frequency (Hz)"); ax.set_title(title)
-    fig.colorbar(cf, ax=ax, pad=0.02, label="Squared coherence")
-    ax.legend(loc="upper right")
-    fig.tight_layout()
-    if path is not None:
-        fig.savefig(path, dpi=200); plt.close(fig)
-    return fig
-
-
-# =============================================================================
-# Matched cross-trial null (significance of coherence)
-# =============================================================================
-
-def _n_derangements(n):
-    d = [1, 0]
-    for k in range(2, n + 1):
-        d.append((k - 1)*(d[-1] + d[-2]))
-    return d[n]
-
-
-def random_derangement(n, rng=None):
-    """Random permutation of range(n) with no fixed points (n >= 2)."""
-    n = int(n)
-    if n < 2:
-        raise ValueError('a derangement requires at least two trials')
+    _require_pycwt()
     rng = np.random.default_rng() if rng is None else rng
-    base = np.arange(n)
-    for _ in range(10000):
-        p = rng.permutation(n)
-        if np.all(p != base):
-            return p
-    shift = int(rng.integers(1, n))
-    return np.roll(base, shift)
+    b, a = butter(4, [bp_low/(0.5/dt), bp_high/(0.5/dt)], btype='band')
+    tmp = rng.standard_normal(sig_len)
+    _, scales, freqs_full, coi, *_ = wavelet.cwt(tmp, dt, dj, s0, J, mother)
+    F = freqs_full.size
+    fmask = freqs_full <= fmax
+    inside = (1/freqs_full)[:, None] <= coi[None, :] if coi_mask else None
+    median_coh = np.empty((num_simulations, F), dtype=float)
+    for i in tqdm(range(num_simulations), desc='MC null', leave=False):
+        n1 = zscore(filtfilt(b, a, rng.standard_normal(sig_len)))
+        n2 = zscore(filtfilt(b, a, rng.standard_normal(sig_len)))
+        X, *_ = wavelet.cwt(n1, dt, dj, s0, J, mother)
+        Y, *_ = wavelet.cwt(n2, dt, dj, s0, J, mother)
+        Rsq = _wct_from_cwt(X, Y, scales, dt, dj)
+        if inside is not None:
+            Rsq = np.where(inside, Rsq, np.nan)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            median_coh[i, :] = np.nanmedian(Rsq, axis=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        upper_full = np.nanpercentile(median_coh, 100*(1-alpha), axis=0)
+    return freqs_full[fmask], upper_full[fmask]
 
 
-def cross_trial_null(left_trials, right_trials, fs, bands=DEFAULT_BANDS, n_perm=999,
-                     alpha=0.05, rng=None, fmax=128.0, dj=1/8, w0=6, fmin=4.0,
-                     progress=True):
-    """Test whether left-right coherence exceeds a matched cross-trial null.
+def surrogate_wavelet_threshold(sig1, sig2, fs, alpha=0.05, num_simulations=300,
+                                mode='global_max', fmax=128.0, dj=1/8,
+                                s0=None, J=None, w0=6, rng=None, progress=True):
+    """Legacy phase-randomized wavelet-coherence diagnostic.
 
-    The null pairs the left signal of trial i with the right signal of a
-    different trial j of the same condition. This keeps each signal's spectrum,
-    amplitude modulation and task timing but removes any within-trial coupling.
-    The test statistic is the median (across trials) of the band-median
-    coherence; the null distribution is built from random derangements of the
-    trial labels.
+    This preserves each signal periodogram but destroys the task-locked burst
+    structure. It is therefore not used for V3.3 primary null inference. Use
+    same-condition cross-trial pairing/derangements instead.
 
     Parameters
     ----------
-    left_trials, right_trials : sequences of equal-length 1-D arrays (one per trial),
-        already preprocessed (preprocess_emg_for_coherence). At least 2 trials are
-        required; >= 6 are recommended (with n trials the smallest possible p is
-        1/(D_n + 1), D_n = number of derangements: 2 -> 1/2, 4 -> 1/10, 6 -> 1/266).
-        For n <= 8 with D_n <= n_perm all derangements are used (exact test).
+    mode : {'global_max','pointwise_frequency','frequency_median'}
+        global_max: one threshold from the max coherence anywhere inside the
+            COI for each surrogate (FWER-style control over the displayed map).
+        pointwise_frequency: frequency-specific pointwise thresholds formed
+            from all inside-COI surrogate time samples (uncorrected across the
+            full map; useful descriptively, not a global significance claim).
+        frequency_median: frequency-specific threshold for the *time-median*
+            statistic; use with frequency/band summaries, not map pixels.
 
     Returns
     -------
-    dict with, per band (arrays ordered as `bands`):
-        'bands', 'observed' (median over trials of within-trial coherence),
-        'per_trial' (n_trials x n_bands), 'null_median', 'null_95' (1-alpha
-        quantile), 'excess' (observed - null_median), 'p' (one-sided).
+    freqs, threshold, meta
+        threshold is scalar for global_max, otherwise one value/frequency.
     """
-    left_trials = [np.asarray(x, float) for x in left_trials]
-    right_trials = [np.asarray(y, float) for y in right_trials]
-    n = len(left_trials)
-    if n < 2 or len(right_trials) != n:
-        raise ValueError('need the same number (>= 2) of left and right trials')
+    _require_pycwt()
+    x = np.asarray(sig1, float); y = np.asarray(sig2, float)
+    if x.ndim != 1 or y.shape != x.shape:
+        raise ValueError('sig1 and sig2 must be equal-length 1-D arrays')
+    if mode not in {'global_max','pointwise_frequency','frequency_median'}:
+        raise ValueError('invalid surrogate threshold mode')
     rng = np.random.default_rng() if rng is None else rng
-    kw = dict(fmax=fmax, dj=dj, w0=w0, fmin=fmin)
-    Lc = [compute_cwt_for_coherence(x, fs, **kw) for x in left_trials]
-    Rc = [compute_cwt_for_coherence(y, fs, **kw) for y in right_trials]
-    nb = len(bands)
-    pair = np.full((n, n, nb), np.nan)
-    it = tqdm(range(n), desc='trial pairs', leave=False) if progress else range(n)
-    for i in it:
-        for j in range(n):
-            f, p, coi, R = coherence_from_cached_cwts(Lc[i], Rc[j])
-            pair[i, j] = list(band_medians(R, f, bands, period=p, coi=coi).values())
-    per_trial = pair[np.arange(n), np.arange(n)]
-    observed = np.nanmedian(per_trial, axis=0)
-    # Few trials: use every derangement (exact test). Otherwise sample n_perm of them.
-    n_der = _n_derangements(n)
-    if n <= 8 and n_der <= int(n_perm):
-        perms = [np.array(q) for q in itertools.permutations(range(n))
-                 if all(q[i] != i for i in range(n))]
+    dt = 1.0/float(fs)
+    if s0 is None:
+        s0 = dt
+    J = int(round(8/dj)) if J is None else int(J)
+    mother = wavelet.Morlet(w0)
+    X0, scales, freqs_full, coi, *_ = wavelet.cwt(x, dt, dj, s0, J, mother)
+    fmask = freqs_full <= fmax
+    freqs = freqs_full[fmask]
+    periods = (1.0/freqs_full)[fmask]
+    inside = periods[:, None] <= coi[None, :]
+
+    if mode == 'global_max':
+        stats = np.empty(num_simulations, float)
     else:
-        perms = [random_derangement(n, rng) for _ in range(int(n_perm))]
-    null = np.array([np.nanmedian(pair[np.arange(n), q], axis=0) for q in perms])
-    n_perm = len(perms)
-    return dict(
-        bands=[f"{a}-{b}" for a, b in bands],
-        observed=observed, per_trial=per_trial,
-        null_median=np.nanmedian(null, axis=0),
-        null_95=np.nanpercentile(null, 100*(1-alpha), axis=0),
-        excess=observed - np.nanmedian(null, axis=0),
-        p=(1 + np.sum(null >= observed[None, :], axis=0))/(n_perm + 1),
-        n_trials=n, n_perm=int(n_perm),
-    )
+        stats = np.empty((num_simulations, freqs.size), float)
+        pointwise_pool = [[] for _ in range(freqs.size)] if mode == 'pointwise_frequency' else None
+
+    iterator = tqdm(range(num_simulations), desc='Legacy phase-surrogate null', leave=False) if progress else range(num_simulations)
+    for i in iterator:
+        xs = phase_randomize(x, rng)
+        ys = phase_randomize(y, rng)
+        X, *_ = wavelet.cwt(xs, dt, dj, s0, J, mother)
+        Y, *_ = wavelet.cwt(ys, dt, dj, s0, J, mother)
+        R = _wct_from_cwt(X, Y, scales, dt, dj)[fmask]
+        masked = np.where(inside, R, np.nan)
+        if mode == 'global_max':
+            stats[i] = np.nanmax(masked)
+        elif mode == 'frequency_median':
+            stats[i, :] = np.nanmedian(masked, axis=1)
+        else:
+            # Pooling time samples gives a per-frequency pointwise null.
+            for fi in range(freqs.size):
+                vals = masked[fi]
+                pointwise_pool[fi].append(vals[np.isfinite(vals)])
+
+    q = 100.0*(1.0-alpha)
+    if mode == 'global_max':
+        threshold = float(np.nanpercentile(stats, q))
+    elif mode == 'frequency_median':
+        threshold = np.nanpercentile(stats, q, axis=0)
+    else:
+        threshold = np.array([
+            np.nanpercentile(np.concatenate(v), q) if any(a.size for a in v) else np.nan
+            for v in pointwise_pool
+        ], float)
+    meta = dict(alpha=float(alpha), num_simulations=int(num_simulations), mode=mode,
+                surrogate='legacy_independent_phase_randomization', coi_mask=True,
+                fmax=float(fmax), dj=float(dj), s0=float(s0), J=int(J), w0=float(w0))
+    return freqs, threshold, meta
+
